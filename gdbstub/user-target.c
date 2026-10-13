@@ -13,7 +13,7 @@
 #include "gdbstub/syscalls.h"
 #include "qemu.h"
 #include "internals.h"
-#ifdef CONFIG_LINUX
+#ifdef CONFIG_LINUX_USER
 #include "linux-user/loader.h"
 #include "linux-user/qemu.h"
 #endif
@@ -309,7 +309,7 @@ void gdb_handle_v_file_open(GArray *params, void *user_ctx)
     uint64_t flags = gdb_get_cmd_param(params, 1)->val_ull;
     uint64_t mode = gdb_get_cmd_param(params, 2)->val_ull;
 
-#ifdef CONFIG_LINUX
+#ifdef CONFIG_LINUX_USER
     int fd = do_guest_openat(cpu_env(gdbserver_state.g_cpu), 0, filename,
                              flags, mode, false);
 #else
@@ -371,7 +371,7 @@ void gdb_handle_v_file_readlink(GArray *params, void *user_ctx)
         return;
     }
 
-#ifdef CONFIG_LINUX
+#ifdef CONFIG_LINUX_USER
     ssize_t n = do_guest_readlink(filename, buf, BUFSIZ);
 #else
     ssize_t n = readlink(filename, buf, BUFSIZ);

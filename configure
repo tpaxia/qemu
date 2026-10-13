@@ -254,6 +254,7 @@ EXESUF=""
 system="yes"
 linux_user=""
 bsd_user=""
+zeus_user=""
 plugins="$default_feature"
 subdirs=""
 ninja=""
@@ -704,6 +705,7 @@ for opt do
   --disable-user)
       linux_user="no" ;
       bsd_user="no" ;
+      zeus_user="no" ;
   ;;
   --enable-user) ;;
   --disable-linux-user) linux_user="no"
@@ -713,6 +715,10 @@ for opt do
   --disable-bsd-user) bsd_user="no"
   ;;
   --enable-bsd-user) bsd_user="yes"
+  ;;
+  --disable-zeus-user) zeus_user="no"
+  ;;
+  --enable-zeus-user) zeus_user="yes"
   ;;
   --enable-pie) pie="yes"
   ;;
@@ -811,8 +817,19 @@ if [ -n "$host_arch" ] && [ -d "$source_path/common-user/host/$host_arch" ]; the
             mak_wilds="${mak_wilds} $source_path/configs/targets/*-bsd-user.mak"
         fi
     fi
+    # ZEUS user-mode emulation translates every system call to POSIX and
+    # needs no matching host kernel; it is enabled on hosts whose user-mode
+    # host support is present.
+    if [ "$zeus_user" != no ]; then
+        if [ "$zeus_user" = "" ]; then
+            test $host_os = linux && zeus_user=yes
+        fi
+        if [ "$zeus_user" = "yes" ]; then
+            mak_wilds="${mak_wilds} $source_path/configs/targets/*-zeus-user.mak"
+        fi
+    fi
 else
-    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ]; then
+    if [ "$linux_user" = yes ] || [ "$bsd_user" = yes ] || [ "$zeus_user" = yes ]; then
         error_exit "user mode emulation not supported on this architecture"
     fi
 fi
@@ -880,6 +897,7 @@ cat << EOF
   user            supported user emulation targets
   linux-user      all linux usermode emulation targets
   bsd-user        all BSD usermode emulation targets
+  zeus-user       ZEUS (Zilog System 8000) usermode emulation targets
   pie             Position Independent Executables
 
 NOTE: The object files are built at the place where configure is launched
@@ -1775,7 +1793,7 @@ for target in $target_list; do
       test -f "$source_path/tests/tcg/$arch/Makefile.softmmu-target" || continue
       qemu="qemu-system-$arch"
       ;;
-    *-linux-user|*-bsd-user)
+    *-linux-user|*-bsd-user|*-zeus-user)
       qemu="qemu-$arch"
       ;;
   esac

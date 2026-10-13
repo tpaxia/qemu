@@ -64,13 +64,15 @@ target_dirs = config_host['TARGET_DIRS'].split()
 # type of binaries to build
 have_linux_user = false
 have_bsd_user = false
+have_zeus_user = false
 have_system = false
 foreach target : target_dirs
   have_linux_user = have_linux_user or target.endswith('linux-user')
   have_bsd_user = have_bsd_user or target.endswith('bsd-user')
+  have_zeus_user = have_zeus_user or target.endswith('zeus-user')
   have_system = have_system or target.endswith('-softmmu')
 endforeach
-have_user = have_linux_user or have_bsd_user
+have_user = have_linux_user or have_bsd_user or have_zeus_user
 
 ############
 # Programs #
@@ -3301,6 +3303,8 @@ foreach target : target_dirs
       error('Target @0@ is only available on a BSD host'.format(target))
     endif
     config_target += { 'CONFIG_BSD_USER': 'y' }
+  elif target.endswith('zeus-user')
+    config_target += { 'CONFIG_ZEUS_USER': 'y' }
   elif target.endswith('softmmu')
     config_target += { 'CONFIG_SYSTEM_ONLY': 'y' }
     config_target += { 'CONFIG_SOFTMMU': 'y' }
@@ -3879,6 +3883,7 @@ common_user_inc = []
 subdir('common-user')
 subdir('bsd-user')
 subdir('linux-user')
+subdir('zeus-user')
 
 # needed for fuzzing binaries
 subdir('tests/qtest/libqos')
@@ -4300,6 +4305,9 @@ foreach target : target_dirs
     endif
     if 'CONFIG_LINUX_USER' in config_target
       base_dir = 'linux-user'
+    endif
+    if 'CONFIG_ZEUS_USER' in config_target
+      base_dir = 'zeus-user'
     endif
     if 'CONFIG_BSD_USER' in config_target
       base_dir = 'bsd-user'

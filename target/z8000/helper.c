@@ -9,7 +9,9 @@
 #include "cpu.h"
 #include "accel/tcg/cpu-ops.h"
 #include "accel/tcg/cpu-loop.h"
+#ifndef CONFIG_USER_ONLY
 #include "exec/cputlb.h"
+#endif
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "accel/tcg/cpu-ldst.h"
@@ -144,13 +146,13 @@ static inline int sp_reg(CPUZ8000State *env)
     return z8000_segmented_mode(env) ? 14 : 15;
 }
 
-static void pushw(CPUZ8000State *env, int reg, uint32_t v, uintptr_t ra)
+G_GNUC_UNUSED static void pushw(CPUZ8000State *env, int reg, uint32_t v, uintptr_t ra)
 {
     add_to_addr_reg(env, reg, -2);
     wrw(env, addr_from_reg(env, reg), v, ra);
 }
 
-static void pushl(CPUZ8000State *env, int reg, uint32_t v, uintptr_t ra)
+G_GNUC_UNUSED static void pushl(CPUZ8000State *env, int reg, uint32_t v, uintptr_t ra)
 {
     add_to_addr_reg(env, reg, -4);
     wrl(env, addr_from_reg(env, reg), v, ra);
@@ -309,6 +311,7 @@ G_NORETURN void HELPER(halt)(CPUZ8000State *env)
     cpu_loop_exit(cs);
 }
 
+#ifndef CONFIG_USER_ONLY
 static uint32_t psa_addr(CPUZ8000State *env)
 {
     if (env->segmented_cpu) {
@@ -390,6 +393,8 @@ bool z8000_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                  TARGET_PAGE_SIZE);
     return true;
 }
+
+#endif /* !CONFIG_USER_ONLY */
 
 /* ---- I/O ---- */
 

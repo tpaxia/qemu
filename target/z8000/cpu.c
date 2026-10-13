@@ -8,8 +8,10 @@
 #include "qapi/error.h"
 #include "qemu/qemu-print.h"
 #include "exec/translation-block.h"
+#ifndef CONFIG_USER_ONLY
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#endif
 #include "cpu.h"
 #include "tcg/debug-assert.h"
 #include "accel/tcg/cpu-ops.h"
@@ -24,10 +26,12 @@ static vaddr z8000_cpu_get_pc(CPUState *cs)
     return cpu_env(cs)->pc;
 }
 
+#ifndef CONFIG_USER_ONLY
 static bool z8000_cpu_has_work(CPUState *cs)
 {
     return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
 }
+#endif
 
 static int z8000_cpu_mmu_index(CPUState *cs, bool ifetch)
 {
@@ -68,6 +72,7 @@ static void z8000_restore_state_to_opc(CPUState *cs,
     cpu_env(cs)->pc = data[0];
 }
 
+#ifndef CONFIG_USER_ONLY
 static uint32_t reset_ldw(uint32_t addr)
 {
     uint8_t buf[2] = { 0, 0 };
@@ -76,6 +81,7 @@ static uint32_t reset_ldw(uint32_t addr)
                        buf, 2);
     return (buf[0] << 8) | buf[1];
 }
+#endif
 
 static void z8000_cpu_reset_hold(Object *obj, ResetType type)
 {
@@ -96,6 +102,10 @@ static void z8000_cpu_reset_hold(Object *obj, ResetType type)
     env->op0 = 0;
     env->irq_vec = 0;
 
+#ifdef CONFIG_USER_ONLY
+    /* the program loader sets the PC, FCW and stack pointer */
+    env->pc = 0;
+#else
     /* Program status loaded from the reset vector. */
     z8000_change_fcw(env, reset_ldw(2));
     if (zcc->segmented) {
@@ -104,6 +114,7 @@ static void z8000_cpu_reset_hold(Object *obj, ResetType type)
     } else {
         env->pc = reset_ldw(4);
     }
+#endif
 }
 
 static void z8000_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -159,12 +170,14 @@ static void z8000_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     }
 }
 
+#ifndef CONFIG_USER_ONLY
 #include "hw/core/sysemu-cpu-ops.h"
 
 static const struct SysemuCPUOps z8000_sysemu_ops = {
     .has_work = z8000_cpu_has_work,
     .get_phys_addr_debug = z8000_cpu_get_phys_addr_debug,
 };
+#endif
 
 static const TCGCPUOps z8000_tcg_ops = {
     .guest_default_memory_order = 0,
@@ -175,12 +188,14 @@ static const TCGCPUOps z8000_tcg_ops = {
     .synchronize_from_tb = z8000_cpu_synchronize_from_tb,
     .restore_state_to_opc = z8000_restore_state_to_opc,
     .mmu_index = z8000_cpu_mmu_index,
+#ifndef CONFIG_USER_ONLY
     .cpu_exec_interrupt = z8000_cpu_exec_interrupt,
     .cpu_exec_halt = z8000_cpu_has_work,
     .cpu_exec_reset = cpu_reset,
     .tlb_fill = z8000_cpu_tlb_fill,
     .do_interrupt = z8000_cpu_do_interrupt,
     .pointer_wrap = cpu_pointer_wrap_uint32,
+#endif
 };
 
 static void z8000_cpu_class_init(ObjectClass *oc, const void *data)
@@ -199,7 +214,9 @@ static void z8000_cpu_class_init(ObjectClass *oc, const void *data)
     cc->dump_state = z8000_cpu_dump_state;
     cc->set_pc = z8000_cpu_set_pc;
     cc->get_pc = z8000_cpu_get_pc;
+#ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &z8000_sysemu_ops;
+#endif
     cc->tcg_ops = &z8000_tcg_ops;
 }
 

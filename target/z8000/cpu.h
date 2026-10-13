@@ -16,6 +16,9 @@
 /* Instruction fetch and data use separate MMU indexes. */
 #define MMU_CODE_IDX 0
 #define MMU_DATA_IDX 1
+#ifdef CONFIG_USER_ONLY
+#define MMU_USER_IDX MMU_DATA_IDX
+#endif
 
 /*
  * Guest virtual address layout:
@@ -111,12 +114,14 @@ static inline bool z8000_segmented_mode(const CPUZ8000State *env)
 
 void z8000_change_fcw(CPUZ8000State *env, uint32_t fcw);
 
+#ifndef CONFIG_USER_ONLY
 void z8000_cpu_do_interrupt(CPUState *cpu);
 bool z8000_cpu_exec_interrupt(CPUState *cpu, int int_req);
 hwaddr z8000_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
 bool z8000_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                         MMUAccessType access_type, int mmu_idx,
                         bool probe, uintptr_t retaddr);
+#endif
 
 void z8000_cpu_tcg_init(void);
 void z8000_cpu_translate_code(CPUState *cs, TranslationBlock *tb,
