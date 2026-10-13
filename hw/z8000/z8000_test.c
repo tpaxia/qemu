@@ -137,7 +137,8 @@ static void test_halt(void *opaque)
     for (int i = 0; i < 16; i++) {
         put16(f, env->regs[i]);
     }
-    put16(f, env->pc >> 16);
+    /* segment number, with the PC's segment-word bit 15 in bit 15 */
+    put16(f, ((env->pc >> 16) & 0x7f) | ((env->pc >> 8) & 0x8000));
     put16(f, env->pc);
     put16(f, env->fcw);
     put16(f, env->psapseg);

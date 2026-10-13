@@ -96,7 +96,8 @@ static void z8000_cpu_reset_hold(Object *obj, ResetType type)
     /* Program status loaded from the reset vector. */
     z8000_change_fcw(env, reset_ldw(2));
     if (zcc->segmented) {
-        env->pc = ((reset_ldw(4) & 0x7f00) << 8) | reset_ldw(6);
+        /* bit 15 of the segment word is kept as bit 23 of the PC */
+        env->pc = ((reset_ldw(4) & 0xff00) << 8) | reset_ldw(6);
     } else {
         env->pc = reset_ldw(4);
     }

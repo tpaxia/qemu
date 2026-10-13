@@ -54,9 +54,20 @@ static inline uint32_t segmented_addr(uint32_t v)
     return ((v & 0x7f000000) >> 8) | (v & 0xffff);
 }
 
-static inline uint32_t make_segmented_addr(uint32_t addr)
+/*
+ * The PC carries bit 15 of the segment word it was loaded from as bit 23
+ * (PC_B15); these convert between the PC and its segmented long form.
+ */
+#define PC_B15 0x800000
+
+static inline uint32_t pc_to_long(uint32_t pc)
 {
-    return ((addr & 0x007f0000) << 8) | 0x80000000 | (addr & 0xffff);
+    return ((pc & 0x00ff0000) << 8) | (pc & 0xffff);
+}
+
+static inline uint32_t pc_from_long(uint32_t v)
+{
+    return ((v & 0xff000000) >> 8) | (v & 0xffff);
 }
 
 static inline uint32_t addr_from_reg(CPUZ8000State *env, int reg)
@@ -200,8 +211,9 @@ uint32_t HELPER(ldctl_rd)(CPUZ8000State *env, uint32_t ctl)
     switch (ctl) {
     case 2: return env->fcw;
     case 3: return env->refresh;
-    case 4: return env->psapseg;
-    case 5: return env->psapoff;
+    /* the low bytes of PSAPSEG and PSAPOFF are not implemented */
+    case 4: return env->psapseg & 0xff00;
+    case 5: return env->psapoff & 0xff00;
     case 6: return env->nspseg;
     case 7: return env->nspoff;
     }
@@ -213,7 +225,8 @@ void HELPER(ldctl_wr)(CPUZ8000State *env, uint32_t ctl, uint32_t v)
     v &= 0xffff;
     switch (ctl) {
     case 2:
-        z8000_change_fcw(env, v);
+        /* FCW bits 10-8 and 1-0 are not implemented */
+        z8000_change_fcw(env, v & 0xf8fc);
         break;
     case 3:
         env->refresh = v;
@@ -222,7 +235,7 @@ void HELPER(ldctl_wr)(CPUZ8000State *env, uint32_t ctl, uint32_t v)
         env->psapseg = v;
         break;
     case 5:
-        env->psapoff = v & 0xff00;
+        env->psapoff = v;
         break;
     case 6:
         env->nspseg = v;
@@ -244,13 +257,11 @@ void HELPER(ldps)(CPUZ8000State *env, uint32_t addr, uint32_t keepseg)
 
     if (z8000_segmented_mode(env)) {
         fcw = rdw(env, addr + 2, ra);
-        pc = segmented_addr(rdl(env, addr + 4, ra));
+        pc = pc_from_long(rdl(env, addr + 4, ra));
     } else {
         fcw = rdw(env, addr, ra);
         pc = rdw(env, (addr + 2) & 0xffff, ra);
-        if (keepseg) {
-            pc |= env->pc & 0xffff0000;
-        }
+        pc |= env->pc & (keepseg ? 0xffff0000 : PC_B15);
     }
     env->pc = pc;
     z8000_change_fcw(env, fcw);
@@ -264,9 +275,9 @@ void HELPER(iret)(CPUZ8000State *env)
     popw(env, sp_reg(env), ra);         /* identifier word */
     fcw = popw(env, sp_reg(env), ra);
     if (z8000_segmented_mode(env)) {
-        pc = segmented_addr(popl(env, sp_reg(env), ra));
+        pc = pc_from_long(popl(env, sp_reg(env), ra));
     } else {
-        pc = popw(env, sp_reg(env), ra);
+        pc = popw(env, sp_reg(env), ra) | (env->pc & PC_B15);
     }
     env->pc = pc;
     z8000_change_fcw(env, fcw);
@@ -298,9 +309,9 @@ G_NORETURN void HELPER(halt)(CPUZ8000State *env)
 static uint32_t psa_addr(CPUZ8000State *env)
 {
     if (env->segmented_cpu) {
-        return ((env->psapseg & 0x7f00) << 8) | env->psapoff;
+        return ((env->psapseg & 0x7f00) << 8) | (env->psapoff & 0xff00);
     }
-    return env->psapoff;
+    return env->psapoff & 0xff00;
 }
 
 void z8000_cpu_do_interrupt(CPUState *cs)
@@ -327,7 +338,7 @@ void z8000_cpu_do_interrupt(CPUState *cs)
     z8000_change_fcw(env, old_fcw | F_S_N |
                      (env->segmented_cpu ? F_SEG : 0));
     if (env->segmented_cpu) {
-        pushl(env, sp_reg(env), make_segmented_addr(env->pc), 0);
+        pushl(env, sp_reg(env), pc_to_long(env->pc), 0);
     } else {
         pushw(env, sp_reg(env), env->pc & 0xffff, 0);
     }
@@ -339,9 +350,9 @@ void z8000_cpu_do_interrupt(CPUState *cs)
         new_fcw = rdw(env, vec + 2, 0);
         if (excp == EXCP_Z8000_VI) {
             vec = psa_addr(env) + mult * 0x1e + 2 * (env->irq_vec & 0xff);
-            env->pc = segmented_addr(rdl(env, vec, 0));
+            env->pc = pc_from_long(rdl(env, vec, 0));
         } else {
-            env->pc = segmented_addr(rdl(env, vec + 4, 0));
+            env->pc = pc_from_long(rdl(env, vec + 4, 0));
         }
     } else {
         new_fcw = rdw(env, vec, 0);
@@ -531,17 +542,11 @@ uint32_t HELPER(blk_tr)(CPUZ8000State *env, uint32_t desc)
     uint32_t xlt = rdb(env, addr_add(addr_from_reg(env, src),
                                      rdb(env, daddr, ra)), ra);
 
+    /* RH1 receives the translated byte after the pointer is stepped. */
     if (test) {
-        if (kind == 0xa) {
-            /* TRTDB updates the pointer before RH1 */
-            set_flag(env, F_Z, !xlt);
-            add_to_addr_reg(env, dst, step);
-            rb_set(env, 1, xlt);
-        } else {
-            rb_set(env, 1, xlt);
-            set_flag(env, F_Z, !xlt);
-            add_to_addr_reg(env, dst, step);
-        }
+        set_flag(env, F_Z, !xlt);
+        add_to_addr_reg(env, dst, step);
+        rb_set(env, 1, xlt);
         if (dec_count(env, cnt)) {
             set_flag(env, F_PV, false);
             return repeat && !xlt;
@@ -549,9 +554,9 @@ uint32_t HELPER(blk_tr)(CPUZ8000State *env, uint32_t desc)
         set_flag(env, F_PV, true);
         return 0;
     }
-    rb_set(env, 1, xlt);
-    wrb(env, addr_from_reg(env, dst), xlt, ra);
+    wrb(env, daddr, xlt, ra);
     add_to_addr_reg(env, dst, step);
+    rb_set(env, 1, xlt);
     if (dec_count(env, cnt)) {
         set_flag(env, F_PV, false);
         return repeat;

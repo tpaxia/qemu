@@ -48,7 +48,8 @@ enum {
 
 typedef struct CPUArchState {
     uint32_t regs[16];      /* R0-R15, 16 bits each */
-    uint32_t pc;            /* segment << 16 | offset */
+    uint32_t pc;            /* segment << 16 | offset; bit 23 = bit 15 of
+                               the segment word the PC was loaded from */
     uint32_t fcw;
     uint32_t psapseg;
     uint32_t psapoff;

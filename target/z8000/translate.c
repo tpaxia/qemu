@@ -6,6 +6,10 @@
  * registers or small immediates.  Segmented addresses are folded into one
  * flat 23-bit guest address (segment << 16 | offset).
  *
+ * The Z8001 keeps bit 15 of the segment word the PC was loaded from and
+ * writes it back wherever the PC is stored as a segmented long (LDAR,
+ * CALL, CALR, traps).  That bit is carried as bit 23 of the PC (PC_B15).
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -33,6 +37,8 @@ static TCGv_i32 cpu_fcw;
 
 #define DISAS_EXIT   DISAS_TARGET_0  /* PC is set; return to the main loop */
 
+#define PC_B15  0x800000
+
 enum { SZ_B, SZ_W, SZ_L };
 
 typedef struct DisasContext {
@@ -42,6 +48,7 @@ typedef struct DisasContext {
     uint32_t insn_pc;   /* address of the current instruction */
     uint32_t pcseg;     /* PC segment bits, used in non-segmented mode */
     uint16_t op0;
+    bool addr_b15;      /* bit 15 of the last address operand's first word */
     bool seg;           /* segmented mode */
     bool sys;           /* system mode */
     bool epu;           /* extended processing unit enabled */
@@ -91,6 +98,7 @@ static uint32_t fetch_addr(DisasContext *ctx)
     uint32_t w = fetch(ctx);
 
     if (ctx->seg) {
+        ctx->addr_b15 = w >> 15;
         if (w & 0x8000) {
             return ((w & 0x7f00) << 8) | fetch(ctx);
         }
@@ -441,13 +449,55 @@ static void gen_jump_dyn(DisasContext *ctx, TCGv_i32 target)
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
-/* A constant jump target: non-segmented mode keeps the PC segment. */
+/*
+ * A constant PC-relative jump target: the segment and PC_B15 come from the
+ * current PC, which addr already carries.
+ */
 static uint32_t jump_target(DisasContext *ctx, uint32_t addr)
 {
     if (ctx->seg) {
         return addr;
     }
     return (ctx->pc & 0xffff0000) | (addr & 0xffff);
+}
+
+/* Jump target given by an address operand just read with fetch_addr(). */
+static uint32_t jump_target_addr(DisasContext *ctx, uint32_t addr)
+{
+    if (ctx->seg) {
+        return (addr & 0x7fffff) | (ctx->addr_b15 ? PC_B15 : 0);
+    }
+    return (ctx->pc & 0xffff0000) | (addr & 0xffff);
+}
+
+/* Jump target held in a register (pair, in segmented mode). */
+static TCGv_i32 jump_reg(DisasContext *ctx, int reg)
+{
+    TCGv_i32 a = tcg_temp_new_i32();
+
+    if (ctx->seg) {
+        tcg_gen_andi_i32(a, cpu_r[reg & 14], 0xff00);
+        tcg_gen_shli_i32(a, a, 8);
+        tcg_gen_or_i32(a, a, cpu_r[(reg & 14) | 1]);
+    } else {
+        tcg_gen_ori_i32(a, cpu_r[reg], ctx->pc & 0xffff0000);
+    }
+    return a;
+}
+
+/* Jump target given by an indexed address operand. */
+static TCGv_i32 jump_x(DisasContext *ctx, uint32_t addr, int reg)
+{
+    TCGv_i32 a = ea_x(ctx, addr, reg);
+
+    if (ctx->seg) {
+        if (ctx->addr_b15) {
+            tcg_gen_ori_i32(a, a, PC_B15);
+        }
+    } else {
+        tcg_gen_ori_i32(a, a, ctx->pc & PC_B15);
+    }
+    return a;
 }
 
 static void gen_trap(DisasContext *ctx, int excp, uint32_t pc)
@@ -557,8 +607,7 @@ static void gen_branch_cc(DisasContext *ctx, int cc, uint32_t dest)
 static void gen_push_pc(DisasContext *ctx)
 {
     if (ctx->seg) {
-        uint32_t v = 0x80000000 | ((ctx->pc & 0x7f0000) << 8) |
-                     (ctx->pc & 0xffff);
+        uint32_t v = ((ctx->pc & 0xff0000) << 8) | (ctx->pc & 0xffff);
         gen_push(ctx, SZ_L, sp_reg(ctx), tcg_constant_i32(v));
     } else {
         gen_push(ctx, SZ_W, sp_reg(ctx), tcg_constant_i32(ctx->pc & 0xffff));
@@ -812,6 +861,7 @@ static bool gen_dyadic(DisasContext *ctx, int mode, int op6, int n2, int n3)
         decode_operand(ctx, mode, n2, &o);
         s = operand_load(ctx, &o, SZ_L);
         q = tcg_temp_new_i64();
+        n3 &= 12;      /* quad register */
         gen_helper_multl(q, tcg_env, load_rl(n3 + 2), s);
         r = tcg_temp_new_i32();
         d = tcg_temp_new_i32();
@@ -830,6 +880,7 @@ static bool gen_dyadic(DisasContext *ctx, int mode, int op6, int n2, int n3)
         decode_operand(ctx, mode, n2, &o);
         s = operand_load(ctx, &o, SZ_L);
         q = tcg_temp_new_i64();
+        n3 &= 12;      /* quad register */
         tcg_gen_concat_i32_i64(q, load_rl(n3 + 2), load_rl(n3));
         gen_helper_divl(q, tcg_env, q, s);
         r = tcg_temp_new_i32();
@@ -897,7 +948,8 @@ static void gen_group2(DisasContext *ctx, int op6, int n2, int n3)
             break;
         }
         break;
-    case 0x0e: /* extended instruction */
+    case 0x0e:
+    case 0x0f: /* extended instructions */
         gen_ext_insn(ctx);
         break;
     case 0x11: /* PUSHL @rd,rrs */
@@ -927,7 +979,7 @@ static void gen_group2(DisasContext *ctx, int op6, int n2, int n3)
             t = tcg_temp_new_i32();
             if (ctx->seg) {
                 v = gen_pop(ctx, SZ_L, sp_reg(ctx));
-                tcg_gen_andi_i32(t, v, 0x7f000000);
+                tcg_gen_andi_i32(t, v, 0xff000000);
                 tcg_gen_shri_i32(t, t, 8);
                 tcg_gen_deposit_i32(t, t, v, 0, 16);
             } else {
@@ -986,9 +1038,9 @@ static void gen_group2(DisasContext *ctx, int op6, int n2, int n3)
             tcg_gen_ext8s_i32(cpu_r[n2], cpu_r[n2]);
             tcg_gen_ext16u_i32(cpu_r[n2], cpu_r[n2]);
         } else if (n3 == 7) {
-            v = load_rl(n2 + 2);
+            v = load_rl((n2 & 12) + 2);
             tcg_gen_sari_i32(v, v, 31);
-            store_rl(n2, v);
+            store_rl(n2 & 12, v);
         } else {
             v = tcg_temp_new_i32();
             tcg_gen_ext16s_i32(v, cpu_r[(n2 & 14) | 1]);
@@ -1258,12 +1310,8 @@ static void translate_insn(DisasContext *ctx)
         break;
     case 0x0e:
     case 0x0f:
-        if (mode == 1 && op6 == 0x0e) { /* LDB addr(rd),rbs */
-            addr = fetch_addr(ctx);
-            gen_st(SZ_B, load_rb(n3), ea_x(ctx, addr, n2), MMU_DATA_IDX);
-        } else {
-            gen_ext_insn(ctx);
-        }
+        /* 0E, 0F, 4E and 4F are extended instructions */
+        gen_ext_insn(ctx);
         break;
     case 0x11: /* PUSHL @rd,src */
     case 0x13: /* PUSH @rd,src */
@@ -1310,7 +1358,8 @@ static void translate_insn(DisasContext *ctx)
         break;
     case 0x1e: /* JP cc,dst */
         if (mode == 1 && n2 == 0) {
-            gen_branch_cc(ctx, n3, jump_target(ctx, fetch_addr(ctx)));
+            addr = fetch_addr(ctx);
+            gen_branch_cc(ctx, n3, jump_target_addr(ctx, addr));
         } else {
             TCGLabel *skip = NULL;
 
@@ -1322,7 +1371,7 @@ static void translate_insn(DisasContext *ctx)
                 skip = gen_new_label();
                 tcg_gen_brcondi_i32(TCG_COND_EQ, gen_cond(n3), 0, skip);
             }
-            a = mode == 1 ? ea_x(ctx, addr, n2) : ea_reg(ctx, n2);
+            a = mode == 1 ? jump_x(ctx, addr, n2) : jump_reg(ctx, n2);
             gen_jump_dyn(ctx, a);
             if (skip) {
                 gen_set_label(skip);
@@ -1335,13 +1384,13 @@ static void translate_insn(DisasContext *ctx)
             addr = fetch_addr(ctx);
             gen_push_pc(ctx);
             if (n2 == 0) {
-                gen_goto_tb(ctx, 0, jump_target(ctx, addr));
+                gen_goto_tb(ctx, 0, jump_target_addr(ctx, addr));
             } else {
-                gen_jump_dyn(ctx, ea_x(ctx, addr, n2));
+                gen_jump_dyn(ctx, jump_x(ctx, addr, n2));
             }
         } else {
             gen_push_pc(ctx);
-            gen_jump_dyn(ctx, ea_reg(ctx, n2));
+            gen_jump_dyn(ctx, jump_reg(ctx, n2));
         }
         break;
     case 0x22 ... 0x27: /* RES/SET/BIT */
@@ -1396,8 +1445,8 @@ static void translate_insn(DisasContext *ctx)
                 break;
             }
             w = fetch(ctx);
-            addr = addr_add(ctx->pc, (int16_t)w) & 0x7fffff;
-            a = tcg_constant_i32(addr);
+            addr = addr_add(ctx->pc, (int16_t)w);
+            a = tcg_constant_i32(addr & 0x7fffff);
             switch (op6) {
             case 0x30:
             case 0x31:
@@ -1411,8 +1460,7 @@ static void translate_insn(DisasContext *ctx)
                 break;
             case 0x34: /* LDAR */
                 if (ctx->seg) {
-                    tcg_gen_movi_i32(cpu_r[n3],
-                                     0x8000 | ((addr >> 8) & 0x7f00));
+                    tcg_gen_movi_i32(cpu_r[n3], (addr >> 8) & 0xff00);
                     tcg_gen_movi_i32(cpu_r[n3 | 1], addr & 0xffff);
                 } else {
                     tcg_gen_movi_i32(cpu_r[n3], addr & 0xffff);
