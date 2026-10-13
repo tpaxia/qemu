@@ -8,7 +8,10 @@
 #define Z8000_CPU_PARAM_H
 
 #define TARGET_PAGE_BITS 10
-/* 7-bit segment number, 16-bit offset, one address-space tag bit. */
-#define TARGET_VIRT_ADDR_SPACE_BITS 24
+/*
+ * 7-bit segment number and 16-bit offset, bit 23 for the PC's segment-word
+ * bit 15, bit 24 for the data-space tag of split I&D programs.
+ */
+#define TARGET_VIRT_ADDR_SPACE_BITS 25
 
 #endif

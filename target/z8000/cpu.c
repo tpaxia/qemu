@@ -48,6 +48,9 @@ static TCGTBCPUState z8000_get_tb_cpu_state(CPUState *cs)
     if (env->fcw & F_EPU) {
         flags |= TB_FLAG_EPU;
     }
+    if (env->data_tag) {
+        flags |= TB_FLAG_SPLIT;
+    }
     return (TCGTBCPUState){ .pc = env->pc, .flags = flags };
 }
 

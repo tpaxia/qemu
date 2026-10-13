@@ -13,9 +13,25 @@
 
 #define CPU_RESOLVING_TYPE TYPE_Z8000_CPU
 
-/* Instruction fetch and data use separate MMU indexes (split I&D). */
+/* Instruction fetch and data use separate MMU indexes. */
 #define MMU_CODE_IDX 0
 #define MMU_DATA_IDX 1
+
+/*
+ * Guest virtual address layout:
+ *   bits 15-0   offset
+ *   bits 22-16  segment number
+ *   bit 23      PC only: bit 15 of the segment word the PC was loaded from
+ *   bit 24      data-space tag
+ *
+ * A program with separate instruction and data spaces has two memories at
+ * the same segment:offset.  User-mode emulation has one flat address space
+ * and no MMU, so data references carry Z8000_DATA_TAG when the CPU's
+ * data_tag is set; program references (fetch, PC-relative loads) never do.
+ */
+#define Z8000_PC_B15    0x00800000
+#define Z8000_DATA_TAG  0x01000000
+#define Z8000_PHYS_MASK 0x017fffff
 
 /* Flag and control word */
 #define F_SEG   0x8000  /* segmented mode (Z8001 only) */
@@ -45,6 +61,7 @@ enum {
 #define TB_FLAG_SEG  1
 #define TB_FLAG_SYS  2
 #define TB_FLAG_EPU  4
+#define TB_FLAG_SPLIT 8   /* data references carry Z8000_DATA_TAG */
 
 typedef struct CPUArchState {
     uint32_t regs[16];      /* R0-R15, 16 bits each */
@@ -59,6 +76,7 @@ typedef struct CPUArchState {
     uint32_t op0;           /* first word of a trapping instruction */
     uint32_t irq_vec;
     bool segmented_cpu;     /* true for the Z8001 */
+    uint32_t data_tag;      /* 0, or Z8000_DATA_TAG for split I&D */
 } CPUZ8000State;
 
 typedef struct Z8000IOOps {

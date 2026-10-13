@@ -58,7 +58,7 @@ static inline uint32_t segmented_addr(uint32_t v)
  * The PC carries bit 15 of the segment word it was loaded from as bit 23
  * (PC_B15); these convert between the PC and its segmented long form.
  */
-#define PC_B15 0x800000
+#define PC_B15 Z8000_PC_B15
 
 static inline uint32_t pc_to_long(uint32_t pc)
 {
@@ -86,13 +86,16 @@ static inline void add_to_addr_reg(CPUZ8000State *env, int reg, int n)
     env->regs[reg] = (env->regs[reg] + n) & 0xffff;
 }
 
-/* In non-segmented mode a Z8001 supplies the PC's segment number. */
+/*
+ * Data-space address presented to memory.  In non-segmented mode a Z8001
+ * supplies the PC's segment number; split I&D programs add the data tag.
+ */
 static inline uint32_t adj(CPUZ8000State *env, uint32_t addr)
 {
     if (!z8000_segmented_mode(env)) {
-        return (addr & 0xffff) | (env->pc & 0x7f0000);
+        return (addr & 0xffff) | (env->pc & 0x7f0000) | env->data_tag;
     }
-    return addr & 0x7fffff;
+    return (addr & 0x7fffff) | env->data_tag;
 }
 
 /* ---- memory ---- */
@@ -374,7 +377,7 @@ bool z8000_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 
 hwaddr z8000_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
 {
-    return addr & 0x7fffff;
+    return addr & Z8000_PHYS_MASK;
 }
 
 bool z8000_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
@@ -382,7 +385,7 @@ bool z8000_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                         bool probe, uintptr_t retaddr)
 {
     address &= TARGET_PAGE_MASK;
-    tlb_set_page(cs, address, address & 0x7fffff,
+    tlb_set_page(cs, address, address & Z8000_PHYS_MASK,
                  PAGE_READ | PAGE_WRITE | PAGE_EXEC, mmu_idx,
                  TARGET_PAGE_SIZE);
     return true;

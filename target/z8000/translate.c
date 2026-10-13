@@ -37,7 +37,7 @@ static TCGv_i32 cpu_fcw;
 
 #define DISAS_EXIT   DISAS_TARGET_0  /* PC is set; return to the main loop */
 
-#define PC_B15  0x800000
+#define PC_B15  Z8000_PC_B15
 
 enum { SZ_B, SZ_W, SZ_L };
 
@@ -47,6 +47,7 @@ typedef struct DisasContext {
     uint32_t pc;        /* address of the next word to fetch */
     uint32_t insn_pc;   /* address of the current instruction */
     uint32_t pcseg;     /* PC segment bits, used in non-segmented mode */
+    uint32_t data_tag;  /* ORed into data-space addresses */
     uint16_t op0;
     bool addr_b15;      /* bit 15 of the last address operand's first word */
     bool seg;           /* segmented mode */
@@ -262,23 +263,40 @@ static TCGv_i32 ea_x(DisasContext *ctx, uint32_t addr, int reg)
 
 /* ---- memory ---- */
 
-static void gen_ld(int size, TCGv_i32 val, TCGv_i32 addr, int mmu)
+/*
+ * Address actually presented to memory: data-space references of a split
+ * I&D program carry the data tag; program-space references do not.
+ */
+static TCGv_i32 mem_addr(DisasContext *ctx, TCGv_i32 addr, int mmu, bool even)
 {
-    TCGv_i32 a, lo;
+    TCGv_i32 a = tcg_temp_new_i32();
+
+    if (even) {
+        tcg_gen_andi_i32(a, addr, ~1);
+    } else {
+        tcg_gen_mov_i32(a, addr);
+    }
+    if (mmu == MMU_DATA_IDX && ctx->data_tag) {
+        tcg_gen_ori_i32(a, a, ctx->data_tag);
+    }
+    return a;
+}
+
+static void gen_ld(DisasContext *ctx, int size, TCGv_i32 val, TCGv_i32 addr,
+                   int mmu)
+{
+    TCGv_i32 a = mem_addr(ctx, addr, mmu, size != SZ_B);
+    TCGv_i32 lo;
 
     switch (size) {
     case SZ_B:
-        tcg_gen_qemu_ld_i32(val, addr, mmu, MO_UB);
+        tcg_gen_qemu_ld_i32(val, a, mmu, MO_UB);
         break;
     case SZ_W:
-        a = tcg_temp_new_i32();
-        tcg_gen_andi_i32(a, addr, ~1);
         tcg_gen_qemu_ld_i32(val, a, mmu, MO_BEUW);
         break;
     default:
-        a = tcg_temp_new_i32();
         lo = tcg_temp_new_i32();
-        tcg_gen_andi_i32(a, addr, ~1);
         tcg_gen_qemu_ld_i32(val, a, mmu, MO_BEUW);
         tcg_gen_qemu_ld_i32(lo, ea_add(a, tcg_constant_i32(2)), mmu, MO_BEUW);
         tcg_gen_shli_i32(val, val, 16);
@@ -287,23 +305,21 @@ static void gen_ld(int size, TCGv_i32 val, TCGv_i32 addr, int mmu)
     }
 }
 
-static void gen_st(int size, TCGv_i32 val, TCGv_i32 addr, int mmu)
+static void gen_st(DisasContext *ctx, int size, TCGv_i32 val, TCGv_i32 addr,
+                   int mmu)
 {
-    TCGv_i32 a, hi;
+    TCGv_i32 a = mem_addr(ctx, addr, mmu, size != SZ_B);
+    TCGv_i32 hi;
 
     switch (size) {
     case SZ_B:
-        tcg_gen_qemu_st_i32(val, addr, mmu, MO_UB);
+        tcg_gen_qemu_st_i32(val, a, mmu, MO_UB);
         break;
     case SZ_W:
-        a = tcg_temp_new_i32();
-        tcg_gen_andi_i32(a, addr, ~1);
         tcg_gen_qemu_st_i32(val, a, mmu, MO_BEUW);
         break;
     default:
-        a = tcg_temp_new_i32();
         hi = tcg_temp_new_i32();
-        tcg_gen_andi_i32(a, addr, ~1);
         tcg_gen_shri_i32(hi, val, 16);
         tcg_gen_qemu_st_i32(hi, a, mmu, MO_BEUW);
         tcg_gen_qemu_st_i32(val, ea_add(a, tcg_constant_i32(2)), mmu,
@@ -383,7 +399,7 @@ static TCGv_i32 operand_load(DisasContext *ctx, Operand *o, int size)
         return load_reg(size, o->reg);
     default:
         v = tcg_temp_new_i32();
-        gen_ld(size, v, o->addr, MMU_DATA_IDX);
+        gen_ld(ctx, size, v, o->addr, MMU_DATA_IDX);
         return v;
     }
 }
@@ -393,7 +409,7 @@ static void operand_store(DisasContext *ctx, Operand *o, int size, TCGv_i32 v)
     if (o->kind == K_R) {
         store_reg(size, o->reg, v);
     } else if (o->kind == K_MEM) {
-        gen_st(size, v, o->addr, MMU_DATA_IDX);
+        gen_st(ctx, size, v, o->addr, MMU_DATA_IDX);
     }
 }
 
@@ -415,14 +431,14 @@ static void gen_adjust_ptr(DisasContext *ctx, int reg, int n)
 static void gen_push(DisasContext *ctx, int size, int reg, TCGv_i32 val)
 {
     gen_adjust_ptr(ctx, reg, size == SZ_L ? -4 : -2);
-    gen_st(size, val, ea_reg(ctx, reg), MMU_DATA_IDX);
+    gen_st(ctx, size, val, ea_reg(ctx, reg), MMU_DATA_IDX);
 }
 
 static TCGv_i32 gen_pop(DisasContext *ctx, int size, int reg)
 {
     TCGv_i32 v = tcg_temp_new_i32();
 
-    gen_ld(size, v, ea_reg(ctx, reg), MMU_DATA_IDX);
+    gen_ld(ctx, size, v, ea_reg(ctx, reg), MMU_DATA_IDX);
     gen_adjust_ptr(ctx, reg, size == SZ_L ? 4 : 2);
     return v;
 }
@@ -1323,7 +1339,7 @@ static void translate_insn(DisasContext *ctx)
             a = n3 ? ea_x(ctx, addr, n3) : ea_da(ctx, addr);
         }
         v = tcg_temp_new_i32();
-        gen_ld(size, v, a, MMU_DATA_IDX);
+        gen_ld(ctx, size, v, a, MMU_DATA_IDX);
         gen_push(ctx, size, n2, v);
         break;
     case 0x15: /* POPL dst,@rs */
@@ -1337,7 +1353,7 @@ static void translate_insn(DisasContext *ctx)
             a = n3 ? ea_x(ctx, addr, n3) : ea_da(ctx, addr);
             v = gen_pop(ctx, size, n2);
         }
-        gen_st(size, v, a, MMU_DATA_IDX);
+        gen_st(ctx, size, v, a, MMU_DATA_IDX);
         break;
     case 0x1c: /* TESTL, LDM */
         if (n3 == 8) {
@@ -1451,12 +1467,12 @@ static void translate_insn(DisasContext *ctx)
             case 0x30:
             case 0x31:
                 v = tcg_temp_new_i32();
-                gen_ld(size, v, a, MMU_CODE_IDX);
+                gen_ld(ctx, size, v, a, MMU_CODE_IDX);
                 store_reg(size, n3, v);
                 break;
             case 0x32:
             case 0x33:
-                gen_st(size, load_reg(size, n3), a, MMU_CODE_IDX);
+                gen_st(ctx, size, load_reg(size, n3), a, MMU_CODE_IDX);
                 break;
             case 0x34: /* LDAR */
                 if (ctx->seg) {
@@ -1468,11 +1484,11 @@ static void translate_insn(DisasContext *ctx)
                 break;
             case 0x35:
                 v = tcg_temp_new_i32();
-                gen_ld(SZ_L, v, a, MMU_CODE_IDX);
+                gen_ld(ctx, SZ_L, v, a, MMU_CODE_IDX);
                 store_rl(n3, v);
                 break;
             case 0x37:
-                gen_st(SZ_L, load_rl(n3), a, MMU_CODE_IDX);
+                gen_st(ctx, SZ_L, load_rl(n3), a, MMU_CODE_IDX);
                 break;
             }
             break;
@@ -1513,10 +1529,10 @@ static void translate_insn(DisasContext *ctx)
             size = SZ_L;
         }
         if (op6 == 0x32 || op6 == 0x33 || op6 == 0x37) {
-            gen_st(size, load_reg(size, n3), a, MMU_DATA_IDX);
+            gen_st(ctx, size, load_reg(size, n3), a, MMU_DATA_IDX);
         } else {
             v = tcg_temp_new_i32();
-            gen_ld(size, v, a, MMU_DATA_IDX);
+            gen_ld(ctx, size, v, a, MMU_DATA_IDX);
             store_reg(size, n3, v);
         }
         break;
@@ -1538,6 +1554,7 @@ static void z8000_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->seg = flags & TB_FLAG_SEG;
     ctx->sys = flags & TB_FLAG_SYS;
     ctx->epu = flags & TB_FLAG_EPU;
+    ctx->data_tag = (flags & TB_FLAG_SPLIT) ? Z8000_DATA_TAG : 0;
 }
 
 static void z8000_tr_tb_start(DisasContextBase *db, CPUState *cs)

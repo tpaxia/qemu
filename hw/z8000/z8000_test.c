@@ -16,6 +16,9 @@
  *                   "z8ktest": the z8000_test harness, twelve word
  *                   registers at ports 0x0100-0x010B (normal I/O) and the
  *                   same addresses in special I/O
+ *   split-id=on     separate instruction and data spaces: data references
+ *                   go to a second RAM, loaded from data-image=FILE, and
+ *                   the dump carries that RAM after the first
  *   init=FILE       start state applied after reset instead of the reset
  *                   vector, one item per line:
  *                     pc HEX | fcw HEX | reg N HEX |
@@ -53,8 +56,10 @@ struct Z8000TestState {
     uint8_t *io_log;
     uint16_t latch[3];
 
-    MemoryRegion *aliases;
+    MemoryRegion data_ram;
     uint32_t ram_size;
+    bool split_id;
+    char *data_image;
     char *io_model;
     char *init;
     bool z8ktest_io;
@@ -240,6 +245,9 @@ static void test_halt(void *opaque)
     put16(f, s->io_count);
     fwrite(s->io_log, 6, s->io_count, f);
     fwrite(memory_region_get_ram_ptr(&s->ram), 1, s->dump_size, f);
+    if (s->split_id) {
+        fwrite(memory_region_get_ram_ptr(&s->data_ram), 1, s->dump_size, f);
+    }
     fclose(f);
     exit(0);
 }
@@ -297,8 +305,43 @@ static void test_cpu_reset(void *opaque)
 {
     Z8000TestState *s = opaque;
 
+    s->cpu->env.data_tag = s->split_id ? Z8000_DATA_TAG : 0;
     cpu_reset(CPU(s->cpu));
     test_apply_init(s);
+}
+
+/* Map a RAM at base, repeated to fill 8 MiB when it is smaller. */
+static void test_map_ram(Z8000TestState *s, MemoryRegion *ram,
+                         const char *name, hwaddr base)
+{
+    int n = 8 * MiB / s->ram_size - 1;
+    MemoryRegion *aliases = g_new(MemoryRegion, n);
+
+    memory_region_init_ram(ram, NULL, name, s->ram_size, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), base, ram);
+    for (int i = 0; i < n; i++) {
+        memory_region_init_alias(&aliases[i], NULL, name, ram, 0,
+                                 s->ram_size);
+        memory_region_add_subregion(get_system_memory(),
+                                    base + (hwaddr)(i + 1) * s->ram_size,
+                                    &aliases[i]);
+    }
+}
+
+static void test_load_image(Z8000TestState *s, MemoryRegion *ram,
+                            const char *path)
+{
+    g_autofree gchar *data = NULL;
+    gsize len;
+
+    if (!path) {
+        return;
+    }
+    if (!g_file_get_contents(path, &data, &len, NULL) || len > s->ram_size) {
+        error_report("cannot load image '%s'", path);
+        exit(1);
+    }
+    memcpy(memory_region_get_ram_ptr(ram), data, len);
 }
 
 static void z8000_test_init(MachineState *machine)
@@ -310,22 +353,10 @@ static void z8000_test_init(MachineState *machine)
         error_report("invalid ram-size or dump-size");
         exit(1);
     }
-    memory_region_init_ram(&s->ram, NULL, "z8000-test.ram", s->ram_size,
-                           &error_fatal);
-    memory_region_add_subregion(get_system_memory(), 0, &s->ram);
-    if (s->ram_size < 8 * MiB) {
-        /* repeat the RAM across the whole 23-bit address space */
-        int n = 8 * MiB / s->ram_size - 1;
-
-        s->aliases = g_new(MemoryRegion, n);
-        for (int i = 0; i < n; i++) {
-            memory_region_init_alias(&s->aliases[i], NULL,
-                                     "z8000-test.ram-alias", &s->ram, 0,
-                                     s->ram_size);
-            memory_region_add_subregion(get_system_memory(),
-                                        (hwaddr)(i + 1) * s->ram_size,
-                                        &s->aliases[i]);
-        }
+    test_map_ram(s, &s->ram, "z8000-test.ram", 0);
+    if (s->split_id) {
+        test_map_ram(s, &s->data_ram, "z8000-test.data-ram", Z8000_DATA_TAG);
+        test_load_image(s, &s->data_ram, s->data_image);
     }
     s->z8ktest_io = s->io_model && !strcmp(s->io_model, "z8ktest");
     if (s->io_model && !s->z8ktest_io && strcmp(s->io_model, "stock")) {
@@ -333,17 +364,7 @@ static void z8000_test_init(MachineState *machine)
         exit(1);
     }
 
-    if (machine->firmware) {
-        g_autofree gchar *data = NULL;
-        gsize len;
-
-        if (!g_file_get_contents(machine->firmware, &data, &len, NULL) ||
-            len > s->ram_size) {
-            error_report("cannot load image '%s'", machine->firmware);
-            exit(1);
-        }
-        memcpy(memory_region_get_ram_ptr(&s->ram), data, len);
-    }
+    test_load_image(s, &s->ram, machine->firmware);
 
     s->io_log = g_malloc0(6 * IO_LOG_MAX);
     s->latch[0] = 0x1234;
@@ -380,6 +401,29 @@ static void test_set_io_model(Object *obj, const char *value, Error **errp)
 
     g_free(s->io_model);
     s->io_model = g_strdup(value);
+}
+
+static char *test_get_data_image(Object *obj, Error **errp)
+{
+    return g_strdup(Z8000_TEST_MACHINE(obj)->data_image);
+}
+
+static void test_set_data_image(Object *obj, const char *value, Error **errp)
+{
+    Z8000TestState *s = Z8000_TEST_MACHINE(obj);
+
+    g_free(s->data_image);
+    s->data_image = g_strdup(value);
+}
+
+static bool test_get_split_id(Object *obj, Error **errp)
+{
+    return Z8000_TEST_MACHINE(obj)->split_id;
+}
+
+static void test_set_split_id(Object *obj, bool value, Error **errp)
+{
+    Z8000_TEST_MACHINE(obj)->split_id = value;
 }
 
 static char *test_get_init(Object *obj, Error **errp)
@@ -426,6 +470,14 @@ static void z8000_test_class_init(ObjectClass *oc, const void *data)
                                   test_set_io_model);
     object_class_property_set_description(oc, "io-model",
                                           "port model: stock or z8ktest");
+    object_class_property_add_bool(oc, "split-id", test_get_split_id,
+                                   test_set_split_id);
+    object_class_property_set_description(oc, "split-id",
+                                          "separate instruction and data RAM");
+    object_class_property_add_str(oc, "data-image", test_get_data_image,
+                                  test_set_data_image);
+    object_class_property_set_description(oc, "data-image",
+                                          "image loaded into the data RAM");
     object_class_property_add_str(oc, "init", test_get_init, test_set_init);
     object_class_property_set_description(oc, "init",
                                           "start state applied after reset");
