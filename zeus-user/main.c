@@ -41,6 +41,7 @@ void fork_start(void)
     start_exclusive();
     mmap_fork_start();
     cpu_list_lock();
+    gdbserver_fork_start();
 }
 
 void fork_end(pid_t pid)
@@ -54,6 +55,7 @@ void fork_end(pid_t pid)
     } else {
         cpu_list_unlock();
     }
+    gdbserver_fork_end(thread_cpu, pid);
     end_exclusive();
 }
 
@@ -101,7 +103,10 @@ void cpu_loop(CPUZ8000State *env)
             zeus_force_signal(env, TARGET_SIGSEGV, "memory fault");
             break;
         case EXCP_DEBUG:
-            zeus_force_signal(env, TARGET_SIGTRAP, "breakpoint");
+            /* a debugger's breakpoint or single step, if one is attached */
+            if (gdb_handlesig(cs, TARGET_SIGTRAP, NULL, NULL, 0)) {
+                zeus_force_signal(env, TARGET_SIGTRAP, "breakpoint");
+            }
             break;
         default:
             fprintf(stderr, "qemu-" TARGET_NAME ": unexpected trap %d\n",
@@ -112,6 +117,35 @@ void cpu_loop(CPUZ8000State *env)
     }
 }
 
+/*
+ * Host file of the program to run.  An absolute name is a guest path,
+ * looked up under the ZEUS root, with two exceptions that let a host
+ * shell or the kernel's binfmt_misc name a program by its host path: a
+ * host path that lies inside the root, and one that exists on the host
+ * when there is no such guest path.
+ */
+static char *program_path(const char *name)
+{
+    g_autofree char *real = NULL;
+    char *guest;
+    size_t n;
+
+    if (!zeus_sysroot || name[0] != '/') {
+        return zeus_host_path(name);
+    }
+    real = realpath(name, NULL);
+    n = strlen(zeus_sysroot);
+    if (real && !strncmp(real, zeus_sysroot, n) && real[n] == '/') {
+        return g_steal_pointer(&real);
+    }
+    guest = zeus_host_path(name);
+    if (real && access(guest, F_OK) != 0) {
+        g_free(guest);
+        return g_steal_pointer(&real);
+    }
+    return guest;
+}
+
 static void usage(void)
 {
     printf("qemu-" TARGET_NAME " version " QEMU_FULL_VERSION "\n"
@@ -119,12 +153,14 @@ static void usage(void)
            "ZEUS (Zilog System 8000) user-mode emulator\n"
            "\n"
            "-L path           ZEUS root directory; absolute guest paths are\n"
-           "                  looked up under it\n"
+           "                  looked up under it (default: $ZEUS_ROOT)\n"
            "-E var=value      set a variable in the program's environment\n"
            "-0 name           pass name as the program's argv[0]\n"
            "-cpu model        select CPU (default " TARGET_DEFAULT_CPU_MODEL
            ")\n"
            "-strace           log system calls\n"
+           "-g port           wait for a debugger (gdb remote protocol) on\n"
+           "                  a TCP port or a Unix socket path\n"
            "-d item1[,...]    enable logging of specified items\n"
            "-D logfile        write logs to 'logfile' (default stderr)\n"
            "-one-insn-per-tb  one guest instruction per translation block\n"
@@ -143,6 +179,7 @@ int main(int argc, char **argv)
     g_autofree char *host_file = NULL;
     g_autoptr(GPtrArray) opts = g_ptr_array_new();
     const char *argv0 = NULL;
+    const char *gdbstub = NULL;
     const char *term;
     CPUZ8000State *env;
     TaskState *ts;
@@ -210,6 +247,9 @@ int main(int argc, char **argv)
             log_mask = argv[optind++];
         } else if (!strcmp(r, "D") && optind < argc) {
             log_file = argv[optind++];
+        } else if (!strcmp(r, "g") && optind < argc) {
+            /* not passed on: a program the debugged one starts runs free */
+            gdbstub = argv[optind++];
         } else if (!strcmp(r, "strace")) {
             do_strace = 1;
             g_ptr_array_add(opts, (char *)"-strace");
@@ -221,6 +261,17 @@ int main(int argc, char **argv)
     }
     if (optind >= argc) {
         usage();
+    }
+    if (!zeus_sysroot && getenv("ZEUS_ROOT")) {
+        /* the root for a program started without options */
+        zeus_sysroot = realpath(getenv("ZEUS_ROOT"), NULL);
+        if (!zeus_sysroot) {
+            error_report("ZEUS_ROOT: %s: %s", getenv("ZEUS_ROOT"),
+                         strerror(errno));
+            exit(1);
+        }
+        g_ptr_array_add(opts, (char *)"-L");
+        g_ptr_array_add(opts, (char *)zeus_sysroot);
     }
     g_ptr_array_add(genv, NULL);
     g_ptr_array_add(opts, NULL);
@@ -263,7 +314,7 @@ int main(int argc, char **argv)
     zeus_fs_init();
 
     /* The program is named by a guest path when a root is given. */
-    host_file = zeus_host_path(argv[optind]);
+    host_file = program_path(argv[optind]);
     bprm->filename = host_file;
     {
         const char *program = argv[optind];
@@ -288,6 +339,11 @@ int main(int argc, char **argv)
 
     zeus_signal_init();
     tcg_prologue_init();
+
+    if (gdbstub) {
+        /* returns once a debugger has connected and let the program go */
+        gdbserver_start(gdbstub, &error_fatal);
+    }
 
     cpu_loop(env);
     return 0;

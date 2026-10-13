@@ -197,10 +197,15 @@ void zeus_process_signals(CPUZ8000State *env)
 /* A signal raised by the program's own action (a trap). */
 void zeus_force_signal(CPUZ8000State *env, int zsig, const char *what)
 {
+    /* an attached debugger sees the trap first and may swallow it */
+    if (!gdb_handlesig(env_cpu(env), zsig, NULL, NULL, 0)) {
+        return;
+    }
     if (handlers[zsig] > 1) {
         deliver(env, zsig);
         return;
     }
+    gdb_signalled(env, zsig);
     fflush(stdout);
     fprintf(stderr, "qemu-" TARGET_NAME ": %s, pc %04x\n", what,
             env->pc & 0x7fffff);

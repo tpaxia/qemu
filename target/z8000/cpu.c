@@ -15,6 +15,8 @@
 #include "cpu.h"
 #include "tcg/debug-assert.h"
 #include "accel/tcg/cpu-ops.h"
+#include "gdbstub/helpers.h"
+#include "qemu/bswap.h"
 
 static void z8000_cpu_set_pc(CPUState *cs, vaddr value)
 {
@@ -204,6 +206,54 @@ static const TCGCPUOps z8000_tcg_ops = {
 #endif
 };
 
+/*
+ * gdb remote protocol registers: R0-R15, then the PC as one 32-bit value
+ * (segment number in bits 22-16, offset below) and the FCW.
+ */
+#define GDB_REG_PC   16
+#define GDB_REG_FCW  17
+#define GDB_NUM_REGS 18
+
+static int z8000_cpu_gdb_read_register(CPUState *cs, GByteArray *buf, int n)
+{
+    CPUZ8000State *env = cpu_env(cs);
+
+    if (n < 16) {
+        return gdb_get_reg16(buf, env->regs[n]);
+    }
+    switch (n) {
+    case GDB_REG_PC:
+        return gdb_get_reg32(buf, env->pc);
+    case GDB_REG_FCW:
+        return gdb_get_reg16(buf, env->fcw);
+    }
+    return 0;
+}
+
+static int z8000_cpu_gdb_write_register(CPUState *cs, uint8_t *buf, int n)
+{
+    CPUZ8000State *env = cpu_env(cs);
+
+    if (n < 16) {
+        env->regs[n] = lduw_be_p(buf);
+        return 2;
+    }
+    switch (n) {
+    case GDB_REG_PC:
+        env->pc = ldl_be_p(buf);
+        return 4;
+    case GDB_REG_FCW:
+#ifdef CONFIG_USER_ONLY
+        /* only the flags; the mode bits belong to the program's kind */
+        env->fcw = (env->fcw & 0xff00) | (lduw_be_p(buf) & 0x00fc);
+#else
+        z8000_change_fcw(env, lduw_be_p(buf));
+#endif
+        return 2;
+    }
+    return 0;
+}
+
 static void z8000_cpu_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -220,6 +270,9 @@ static void z8000_cpu_class_init(ObjectClass *oc, const void *data)
     cc->dump_state = z8000_cpu_dump_state;
     cc->set_pc = z8000_cpu_set_pc;
     cc->get_pc = z8000_cpu_get_pc;
+    cc->gdb_read_register = z8000_cpu_gdb_read_register;
+    cc->gdb_write_register = z8000_cpu_gdb_write_register;
+    cc->gdb_core_xml_file = "z8000-cpu.xml";
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &z8000_sysemu_ops;
 #endif

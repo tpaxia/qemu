@@ -14,6 +14,9 @@
 #include "exec/page-protection.h"
 #include "user/page-protection.h"
 #include "target_cpu.h"
+#include "exec/gdbstub.h"
+#include "gdbstub/user.h"
+#include "gdbstub/syscalls.h"
 
 /* Size of one segment, or of a space of a non-segmented program. */
 #define ZEUS_SPACE_SIZE  0x10000

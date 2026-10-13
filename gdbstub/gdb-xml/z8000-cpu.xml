@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- Z8000 registers for the gdb remote protocol.
+
+     SPDX-License-Identifier: GPL-2.0-or-later -->
+
+<!DOCTYPE feature SYSTEM "gdb-target.dtd">
+<feature name="org.qemu.z8000.cpu">
+  <reg name="r0" bitsize="16" type="int" regnum="0"/>
+  <reg name="r1" bitsize="16" type="int"/>
+  <reg name="r2" bitsize="16" type="int"/>
+  <reg name="r3" bitsize="16" type="int"/>
+  <reg name="r4" bitsize="16" type="int"/>
+  <reg name="r5" bitsize="16" type="int"/>
+  <reg name="r6" bitsize="16" type="int"/>
+  <reg name="r7" bitsize="16" type="int"/>
+  <reg name="r8" bitsize="16" type="int"/>
+  <reg name="r9" bitsize="16" type="int"/>
+  <reg name="r10" bitsize="16" type="int"/>
+  <reg name="r11" bitsize="16" type="int"/>
+  <reg name="r12" bitsize="16" type="int"/>
+  <reg name="r13" bitsize="16" type="int"/>
+  <reg name="r14" bitsize="16" type="int"/>
+  <reg name="r15" bitsize="16" type="int"/>
+  <reg name="pc" bitsize="32" type="code_ptr"/>
+  <reg name="fcw" bitsize="16" type="int"/>
+</feature>

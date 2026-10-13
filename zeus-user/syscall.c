@@ -555,6 +555,7 @@ void zeus_syscall(CPUZ8000State *env, int num)
         if (do_strace) {
             fprintf(trace_file(), "\n");
         }
+        gdb_exit(a0 & 0xff);
         exit(a0 & 0xff);
 
     case 3: /* read(fd, buf, count) */
