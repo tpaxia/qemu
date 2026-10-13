@@ -15,8 +15,9 @@
 #endif
 /*
  * 7-bit segment number and 16-bit offset, bit 23 for the PC's segment-word
- * bit 15, bit 24 for the data-space tag of split I&D programs.
+ * bit 15, bit 24 for the data-space tag of split I&D programs, bit 25 for
+ * the system space of user-mode emulation.
  */
-#define TARGET_VIRT_ADDR_SPACE_BITS 25
+#define TARGET_VIRT_ADDR_SPACE_BITS 26
 
 #endif

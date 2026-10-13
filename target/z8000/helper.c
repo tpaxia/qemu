@@ -57,19 +57,19 @@ static inline uint32_t segmented_addr(uint32_t v)
 }
 
 /*
- * The PC carries bit 15 of the segment word it was loaded from as bit 23
- * (PC_B15); these convert between the PC and its segmented long form.
+ * The PC keeps bit 15 of the segment word it was loaded from (pc_b15);
+ * these convert between the PC and its segmented long form.
  */
-#define PC_B15 Z8000_PC_B15
-
-static inline uint32_t pc_to_long(uint32_t pc)
+static inline uint32_t pc_to_long(CPUZ8000State *env)
 {
-    return ((pc & 0x00ff0000) << 8) | (pc & 0xffff);
+    return ((env->pc & 0x007f0000) << 8) | (env->pc & 0xffff) |
+           (env->pc_b15 ? 0x80000000 : 0);
 }
 
-static inline uint32_t pc_from_long(uint32_t v)
+static inline uint32_t pc_from_long(CPUZ8000State *env, uint32_t v)
 {
-    return ((v & 0xff000000) >> 8) | (v & 0xffff);
+    env->pc_b15 = v >> 31;
+    return ((v & 0x7f000000) >> 8) | (v & 0xffff);
 }
 
 static inline uint32_t addr_from_reg(CPUZ8000State *env, int reg)
@@ -262,11 +262,13 @@ void HELPER(ldps)(CPUZ8000State *env, uint32_t addr, uint32_t keepseg)
 
     if (z8000_segmented_mode(env)) {
         fcw = rdw(env, addr + 2, ra);
-        pc = pc_from_long(rdl(env, addr + 4, ra));
+        pc = pc_from_long(env, rdl(env, addr + 4, ra));
     } else {
         fcw = rdw(env, addr, ra);
         pc = rdw(env, (addr + 2) & 0xffff, ra);
-        pc |= env->pc & (keepseg ? 0xffff0000 : PC_B15);
+        if (keepseg) {
+            pc |= env->pc & 0xffff0000;
+        }
     }
     env->pc = pc;
     z8000_change_fcw(env, fcw);
@@ -280,9 +282,9 @@ void HELPER(iret)(CPUZ8000State *env)
     popw(env, sp_reg(env), ra);         /* identifier word */
     fcw = popw(env, sp_reg(env), ra);
     if (z8000_segmented_mode(env)) {
-        pc = pc_from_long(popl(env, sp_reg(env), ra));
+        pc = pc_from_long(env, popl(env, sp_reg(env), ra));
     } else {
-        pc = popw(env, sp_reg(env), ra) | (env->pc & PC_B15);
+        pc = popw(env, sp_reg(env), ra);
     }
     env->pc = pc;
     z8000_change_fcw(env, fcw);
@@ -344,7 +346,7 @@ void z8000_cpu_do_interrupt(CPUState *cs)
     z8000_change_fcw(env, old_fcw | F_S_N |
                      (env->segmented_cpu ? F_SEG : 0));
     if (env->segmented_cpu) {
-        pushl(env, sp_reg(env), pc_to_long(env->pc), 0);
+        pushl(env, sp_reg(env), pc_to_long(env), 0);
     } else {
         pushw(env, sp_reg(env), env->pc & 0xffff, 0);
     }
@@ -356,9 +358,9 @@ void z8000_cpu_do_interrupt(CPUState *cs)
         new_fcw = rdw(env, vec + 2, 0);
         if (excp == EXCP_Z8000_VI) {
             vec = psa_addr(env) + mult * 0x1e + 2 * (env->irq_vec & 0xff);
-            env->pc = pc_from_long(rdl(env, vec, 0));
+            env->pc = pc_from_long(env, rdl(env, vec, 0));
         } else {
-            env->pc = pc_from_long(rdl(env, vec + 4, 0));
+            env->pc = pc_from_long(env, rdl(env, vec + 4, 0));
         }
     } else {
         new_fcw = rdw(env, vec, 0);

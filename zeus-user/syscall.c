@@ -300,6 +300,23 @@ static void do_ioctl(CPUZ8000State *env, int fd, uint32_t req, uint32_t arg)
     }
 }
 
+/*
+ * The trace goes to a private copy of standard error, taken before the
+ * program can close or redirect descriptor 2.
+ */
+static FILE *trace_file(void)
+{
+    static FILE *f;
+
+    if (!f) {
+        int fd = fcntl(2, F_DUPFD_CLOEXEC, 100);
+
+        f = fd >= 0 ? fdopen(fd, "w") : stderr;
+        setvbuf(f, NULL, _IONBF, 0);
+    }
+    return f;
+}
+
 void zeus_syscall(CPUZ8000State *env, int num)
 {
     CPUState *cs = env_cpu(env);
@@ -315,14 +332,14 @@ void zeus_syscall(CPUZ8000State *env, int num)
         num = 63;
     }
     if (do_strace) {
-        fprintf(stderr, "%d %s(%#x, %#x, %#x, %#x)", getpid(),
+        fprintf(trace_file(), "%d %s(%#x, %#x, %#x, %#x)", getpid(),
                 call_names[num], a0, a1, a2, a3);
     }
 
     switch (num) {
     case 1: /* exit */
         if (do_strace) {
-            fprintf(stderr, "\n");
+            fprintf(trace_file(), "\n");
         }
         exit(a0 & 0xff);
 
@@ -622,9 +639,9 @@ void zeus_syscall(CPUZ8000State *env, int num)
 
     if (do_strace) {
         if (env->fcw & F_C) {
-            fprintf(stderr, " = error %d\n", env->regs[4]);
+            fprintf(trace_file(), " = error %d\n", env->regs[4]);
         } else {
-            fprintf(stderr, " = %#x\n", env->regs[4]);
+            fprintf(trace_file(), " = %#x\n", env->regs[4]);
         }
     }
 }

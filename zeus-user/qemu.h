@@ -11,6 +11,7 @@
 #include "qemu/units.h"
 #include "user/abitypes.h"
 #include "user/guest-host.h"
+#include "exec/page-protection.h"
 #include "user/page-protection.h"
 #include "target_cpu.h"
 
@@ -40,6 +41,7 @@ typedef struct TaskState {
     int signal_pending;
     uint32_t brk;           /* current program break */
     uint32_t fault_addr;    /* guest address of the last memory fault */
+    bool in_fpe;            /* the floating-point emulator is running */
 } TaskState;
 
 static inline TaskState *get_task_state(CPUState *cs)
@@ -101,6 +103,10 @@ char *zeus_data_string(CPUZ8000State *env, uint32_t addr);
 /* sout.c */
 int zeus_load(const char *filename, char **argv, char **envp,
               CPUZ8000State *env, struct image_info *info);
+
+/* fpe.c */
+bool zeus_fpe_enter(CPUZ8000State *env);
+void zeus_fpe_call(CPUZ8000State *env, int num);
 
 /* signal.c */
 void zeus_signal_init(void);

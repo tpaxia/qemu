@@ -228,7 +228,7 @@ static void test_halt(void *opaque)
         put16(f, env->regs[i]);
     }
     /* segment number, with the PC's segment-word bit 15 in bit 15 */
-    put16(f, ((env->pc >> 16) & 0x7f) | ((env->pc >> 8) & 0x8000));
+    put16(f, ((env->pc >> 16) & 0x7f) | (env->pc_b15 ? 0x8000 : 0));
     put16(f, env->pc);
     put16(f, env->fcw);
     put16(f, env->psapseg);
@@ -283,7 +283,9 @@ static void test_apply_init(Z8000TestState *s)
         unsigned a, b, c;
 
         if (sscanf(lines[i], "pc %x", &a) == 1) {
-            env->pc = a;
+            /* bit 23 gives the PC's segment-word bit 15 */
+            env->pc = a & 0x7fffff;
+            env->pc_b15 = (a >> 23) & 1;
         } else if (sscanf(lines[i], "fcw %x", &a) == 1) {
             env->fcw = a & 0xffff;
         } else if (sscanf(lines[i], "reg %u %x", &a, &b) == 2 && a < 16) {

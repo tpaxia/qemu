@@ -8,7 +8,8 @@
  *
  * The Z8001 keeps bit 15 of the segment word the PC was loaded from and
  * writes it back wherever the PC is stored as a segmented long (LDAR,
- * CALL, CALR, traps).  That bit is carried as bit 23 of the PC (PC_B15).
+ * CALL, CALR, traps).  That bit is separate CPU state (pc_b15), reflected
+ * in the translation-block flags.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -37,7 +38,6 @@ static TCGv_i32 cpu_fcw;
 
 #define DISAS_EXIT   DISAS_TARGET_0  /* PC is set; return to the main loop */
 
-#define PC_B15  Z8000_PC_B15
 
 enum { SZ_B, SZ_W, SZ_L };
 
@@ -50,6 +50,7 @@ typedef struct DisasContext {
     uint32_t data_tag;  /* ORed into data-space addresses */
     uint16_t op0;
     bool addr_b15;      /* bit 15 of the last address operand's first word */
+    bool pc_b15;        /* bit 15 of the segment word the PC came from */
     bool seg;           /* segmented mode */
     bool sys;           /* system mode */
     bool epu;           /* extended processing unit enabled */
@@ -465,9 +466,30 @@ static void gen_jump_dyn(DisasContext *ctx, TCGv_i32 target)
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
+static void gen_set_pc_b15(TCGv_i32 b15)
+{
+    tcg_gen_st_i32(b15, tcg_env, offsetof(CPUZ8000State, pc_b15));
+}
+
 /*
- * A constant PC-relative jump target: the segment and PC_B15 come from the
- * current PC, which addr already carries.
+ * Jump to a constant address, loading the PC's segment-word bit 15.  A
+ * change of that bit changes the translation-block flags, so the block
+ * cannot be chained directly.
+ */
+static void gen_jump_const(DisasContext *ctx, int slot, uint32_t dest,
+                           bool b15)
+{
+    if (b15 == ctx->pc_b15) {
+        gen_goto_tb(ctx, slot, dest);
+    } else {
+        gen_set_pc_b15(tcg_constant_i32(b15));
+        gen_jump_dyn(ctx, tcg_constant_i32(dest));
+    }
+}
+
+/*
+ * A constant PC-relative jump target: the segment comes from the current
+ * PC, which addr already carries.
  */
 static uint32_t jump_target(DisasContext *ctx, uint32_t addr)
 {
@@ -481,20 +503,32 @@ static uint32_t jump_target(DisasContext *ctx, uint32_t addr)
 static uint32_t jump_target_addr(DisasContext *ctx, uint32_t addr)
 {
     if (ctx->seg) {
-        return (addr & 0x7fffff) | (ctx->addr_b15 ? PC_B15 : 0);
+        return (addr & 0x7fffff) | (ctx->pc & Z8000_SYS_TAG);
     }
     return (ctx->pc & 0xffff0000) | (addr & 0xffff);
 }
 
-/* Jump target held in a register (pair, in segmented mode). */
+/* The segment-word bit 15 the PC takes from an address operand. */
+static bool jump_b15_addr(DisasContext *ctx)
+{
+    return ctx->seg ? ctx->addr_b15 : ctx->pc_b15;
+}
+
+/*
+ * Jump target held in a register (pair, in segmented mode); also loads the
+ * PC's segment-word bit 15 from the pair.
+ */
 static TCGv_i32 jump_reg(DisasContext *ctx, int reg)
 {
     TCGv_i32 a = tcg_temp_new_i32();
 
     if (ctx->seg) {
-        tcg_gen_andi_i32(a, cpu_r[reg & 14], 0xff00);
+        tcg_gen_shri_i32(a, cpu_r[reg & 14], 15);
+        gen_set_pc_b15(a);
+        tcg_gen_andi_i32(a, cpu_r[reg & 14], 0x7f00);
         tcg_gen_shli_i32(a, a, 8);
         tcg_gen_or_i32(a, a, cpu_r[(reg & 14) | 1]);
+        tcg_gen_ori_i32(a, a, ctx->pc & Z8000_SYS_TAG);
     } else {
         tcg_gen_ori_i32(a, cpu_r[reg], ctx->pc & 0xffff0000);
     }
@@ -507,11 +541,8 @@ static TCGv_i32 jump_x(DisasContext *ctx, uint32_t addr, int reg)
     TCGv_i32 a = ea_x(ctx, addr, reg);
 
     if (ctx->seg) {
-        if (ctx->addr_b15) {
-            tcg_gen_ori_i32(a, a, PC_B15);
-        }
-    } else {
-        tcg_gen_ori_i32(a, a, ctx->pc & PC_B15);
+        gen_set_pc_b15(tcg_constant_i32(ctx->addr_b15));
+        tcg_gen_ori_i32(a, a, ctx->pc & Z8000_SYS_TAG);
     }
     return a;
 }
@@ -601,7 +632,7 @@ static TCGv_i32 gen_cond(int cc)
 }
 
 /* Conditional branch to a constant address. */
-static void gen_branch_cc(DisasContext *ctx, int cc, uint32_t dest)
+static void gen_branch_cc(DisasContext *ctx, int cc, uint32_t dest, bool b15)
 {
     TCGLabel *skip;
 
@@ -609,12 +640,12 @@ static void gen_branch_cc(DisasContext *ctx, int cc, uint32_t dest)
         return;
     }
     if (cc == 8) {
-        gen_goto_tb(ctx, 0, dest);
+        gen_jump_const(ctx, 0, dest, b15);
         return;
     }
     skip = gen_new_label();
     tcg_gen_brcondi_i32(TCG_COND_EQ, gen_cond(cc), 0, skip);
-    gen_goto_tb(ctx, 0, dest);
+    gen_jump_const(ctx, 0, dest, b15);
     gen_set_label(skip);
     gen_goto_tb(ctx, 1, ctx->pc);
 }
@@ -623,7 +654,8 @@ static void gen_branch_cc(DisasContext *ctx, int cc, uint32_t dest)
 static void gen_push_pc(DisasContext *ctx)
 {
     if (ctx->seg) {
-        uint32_t v = ((ctx->pc & 0xff0000) << 8) | (ctx->pc & 0xffff);
+        uint32_t v = ((ctx->pc & 0x7f0000) << 8) | (ctx->pc & 0xffff) |
+                     (ctx->pc_b15 ? 0x80000000 : 0);
         gen_push(ctx, SZ_L, sp_reg(ctx), tcg_constant_i32(v));
     } else {
         gen_push(ctx, SZ_W, sp_reg(ctx), tcg_constant_i32(ctx->pc & 0xffff));
@@ -995,9 +1027,12 @@ static void gen_group2(DisasContext *ctx, int op6, int n2, int n3)
             t = tcg_temp_new_i32();
             if (ctx->seg) {
                 v = gen_pop(ctx, SZ_L, sp_reg(ctx));
-                tcg_gen_andi_i32(t, v, 0xff000000);
+                tcg_gen_shri_i32(t, v, 31);
+                gen_set_pc_b15(t);
+                tcg_gen_andi_i32(t, v, 0x7f000000);
                 tcg_gen_shri_i32(t, t, 8);
                 tcg_gen_deposit_i32(t, t, v, 0, 16);
+                tcg_gen_ori_i32(t, t, ctx->pc & Z8000_SYS_TAG);
             } else {
                 v = gen_pop(ctx, SZ_W, sp_reg(ctx));
                 tcg_gen_ori_i32(t, v, ctx->pc & 0xffff0000);
@@ -1269,7 +1304,8 @@ static void translate_insn(DisasContext *ctx)
         case 0xe: /* JR cc */
             gen_branch_cc(ctx, n1,
                           jump_target(ctx, addr_add(ctx->pc,
-                                                    (int8_t)op * 2)));
+                                                    (int8_t)op * 2)),
+                          ctx->pc_b15);
             break;
         default: /* DJNZ / DBJNZ */
             {
@@ -1375,7 +1411,8 @@ static void translate_insn(DisasContext *ctx)
     case 0x1e: /* JP cc,dst */
         if (mode == 1 && n2 == 0) {
             addr = fetch_addr(ctx);
-            gen_branch_cc(ctx, n3, jump_target_addr(ctx, addr));
+            gen_branch_cc(ctx, n3, jump_target_addr(ctx, addr),
+                          jump_b15_addr(ctx));
         } else {
             TCGLabel *skip = NULL;
 
@@ -1400,7 +1437,8 @@ static void translate_insn(DisasContext *ctx)
             addr = fetch_addr(ctx);
             gen_push_pc(ctx);
             if (n2 == 0) {
-                gen_goto_tb(ctx, 0, jump_target_addr(ctx, addr));
+                gen_jump_const(ctx, 0, jump_target_addr(ctx, addr),
+                               jump_b15_addr(ctx));
             } else {
                 gen_jump_dyn(ctx, jump_x(ctx, addr, n2));
             }
@@ -1462,7 +1500,8 @@ static void translate_insn(DisasContext *ctx)
             }
             w = fetch(ctx);
             addr = addr_add(ctx->pc, (int16_t)w);
-            a = tcg_constant_i32(addr & 0x7fffff);
+            a = tcg_constant_i32((addr & 0x7fffff) |
+                                 (ctx->pc & Z8000_SYS_TAG));
             switch (op6) {
             case 0x30:
             case 0x31:
@@ -1476,7 +1515,8 @@ static void translate_insn(DisasContext *ctx)
                 break;
             case 0x34: /* LDAR */
                 if (ctx->seg) {
-                    tcg_gen_movi_i32(cpu_r[n3], (addr >> 8) & 0xff00);
+                    tcg_gen_movi_i32(cpu_r[n3], ((addr >> 8) & 0x7f00) |
+                                     (ctx->pc_b15 ? 0x8000 : 0));
                     tcg_gen_movi_i32(cpu_r[n3 | 1], addr & 0xffff);
                 } else {
                     tcg_gen_movi_i32(cpu_r[n3], addr & 0xffff);
@@ -1554,7 +1594,9 @@ static void z8000_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->seg = flags & TB_FLAG_SEG;
     ctx->sys = flags & TB_FLAG_SYS;
     ctx->epu = flags & TB_FLAG_EPU;
-    ctx->data_tag = (flags & TB_FLAG_SPLIT) ? Z8000_DATA_TAG : 0;
+    ctx->pc_b15 = flags & TB_FLAG_PCB15;
+    ctx->data_tag = (flags & TB_FLAG_SPLIT) ? Z8000_DATA_TAG :
+                    (flags & TB_FLAG_SYSSPACE) ? Z8000_SYS_TAG : 0;
 }
 
 static void z8000_tr_tb_start(DisasContextBase *db, CPUState *cs)

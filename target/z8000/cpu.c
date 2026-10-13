@@ -52,8 +52,13 @@ static TCGTBCPUState z8000_get_tb_cpu_state(CPUState *cs)
     if (env->fcw & F_EPU) {
         flags |= TB_FLAG_EPU;
     }
-    if (env->data_tag) {
+    if (env->data_tag == Z8000_DATA_TAG) {
         flags |= TB_FLAG_SPLIT;
+    } else if (env->data_tag == Z8000_SYS_TAG) {
+        flags |= TB_FLAG_SYSSPACE;
+    }
+    if (env->pc_b15) {
+        flags |= TB_FLAG_PCB15;
     }
     return (TCGTBCPUState){ .pc = env->pc, .flags = flags };
 }
@@ -101,6 +106,7 @@ static void z8000_cpu_reset_hold(Object *obj, ResetType type)
     env->nspseg = env->nspoff = 0;
     env->op0 = 0;
     env->irq_vec = 0;
+    env->pc_b15 = 0;
 
 #ifdef CONFIG_USER_ONLY
     /* the program loader sets the PC, FCW and stack pointer */
@@ -109,8 +115,8 @@ static void z8000_cpu_reset_hold(Object *obj, ResetType type)
     /* Program status loaded from the reset vector. */
     z8000_change_fcw(env, reset_ldw(2));
     if (zcc->segmented) {
-        /* bit 15 of the segment word is kept as bit 23 of the PC */
-        env->pc = ((reset_ldw(4) & 0xff00) << 8) | reset_ldw(6);
+        env->pc = ((reset_ldw(4) & 0x7f00) << 8) | reset_ldw(6);
+        env->pc_b15 = reset_ldw(4) >> 15;
     } else {
         env->pc = reset_ldw(4);
     }

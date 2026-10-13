@@ -24,16 +24,24 @@
  * Guest virtual address layout:
  *   bits 15-0   offset
  *   bits 22-16  segment number
- *   bit 23      PC only: bit 15 of the segment word the PC was loaded from
+ *   bit 23      unused
  *   bit 24      data-space tag
+ *   bit 25      system-space tag
  *
  * A program with separate instruction and data spaces has two memories at
  * the same segment:offset.  User-mode emulation has one flat address space
  * and no MMU, so data references carry Z8000_DATA_TAG when the CPU's
  * data_tag is set; program references (fetch, PC-relative loads) never do.
  */
-#define Z8000_PC_B15    0x00800000
 #define Z8000_DATA_TAG  0x01000000
+/*
+ * User-mode emulation can run system-mode code (the operating system's
+ * floating-point emulator) beside the program.  The real machine gives
+ * system mode its own address translation; here that code lives at
+ * addresses carrying Z8000_SYS_TAG: its PC has the bit set, and data_tag
+ * is Z8000_SYS_TAG while it runs.
+ */
+#define Z8000_SYS_TAG   0x02000000
 #define Z8000_PHYS_MASK 0x017fffff
 
 /* Flag and control word */
@@ -65,11 +73,14 @@ enum {
 #define TB_FLAG_SYS  2
 #define TB_FLAG_EPU  4
 #define TB_FLAG_SPLIT 8   /* data references carry Z8000_DATA_TAG */
+#define TB_FLAG_SYSSPACE 16  /* data references carry Z8000_SYS_TAG */
+#define TB_FLAG_PCB15 32  /* bit 15 of the segment word the PC came from */
 
 typedef struct CPUArchState {
     uint32_t regs[16];      /* R0-R15, 16 bits each */
-    uint32_t pc;            /* segment << 16 | offset; bit 23 = bit 15 of
-                               the segment word the PC was loaded from */
+    uint32_t pc;            /* segment << 16 | offset */
+    uint32_t pc_b15;        /* bit 15 of the segment word the PC was loaded
+                               from; the Z8001 keeps it and writes it back */
     uint32_t fcw;
     uint32_t psapseg;
     uint32_t psapoff;
@@ -79,7 +90,7 @@ typedef struct CPUArchState {
     uint32_t op0;           /* first word of a trapping instruction */
     uint32_t irq_vec;
     bool segmented_cpu;     /* true for the Z8001 */
-    uint32_t data_tag;      /* 0, or Z8000_DATA_TAG for split I&D */
+    uint32_t data_tag;      /* 0, Z8000_DATA_TAG or Z8000_SYS_TAG */
 } CPUZ8000State;
 
 typedef struct Z8000IOOps {

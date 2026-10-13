@@ -80,7 +80,11 @@ void cpu_loop(CPUZ8000State *env)
 
         switch (trapnr) {
         case EXCP_Z8000_SC:
-            zeus_syscall(env, env->op0 & 0xff);
+            if (ts->in_fpe) {
+                zeus_fpe_call(env, env->op0 & 0xff);
+            } else {
+                zeus_syscall(env, env->op0 & 0xff);
+            }
             break;
         case EXCP_INTERRUPT:
             break;
@@ -88,8 +92,11 @@ void cpu_loop(CPUZ8000State *env)
             cpu_exec_step_atomic(cs);
             break;
         case EXCP_Z8000_EPU:
-            fatal_trap(env, "extended (floating-point) instruction, "
-                       "not supported yet", SIGILL);
+            /* executed by the ZEUS kernel's own software emulator */
+            if (!zeus_fpe_enter(env)) {
+                fatal_trap(env, "floating-point instruction", SIGILL);
+            }
+            break;
         case EXCP_Z8000_PRIV:
             fatal_trap(env, "privileged instruction", SIGILL);
         case EXCP_Z8000_SEGTRAP:
