@@ -2,9 +2,12 @@
  * ZEUS user-mode emulation: system calls
  *
  * Calling convention (see abi/ZEUS-ABI.md in the Zeus_emulator project):
- * the call number is the low byte of the SC instruction, arguments are in
- * R0-R3, results come back in R4 (R4:R5 for a long or for a second value),
- * and an error is reported by setting carry with the error number in R4.
+ * the call number is the low byte of the SC instruction, arguments are
+ * words in R0 onwards, results come back in R4 (R4:R5 for a long or for a
+ * second value), and an error is reported by setting carry with the error
+ * number in R4.  A pointer is one word in a non-segmented program and two
+ * in a segmented one, so the argument registers of a call differ between
+ * the two; a long is two words in both.
  *
  * Every call is implemented with POSIX interfaces; nothing is passed
  * through to the host kernel unchanged.
@@ -31,6 +34,7 @@ enum {
     Z_ENFILE = 23, Z_EMFILE = 24, Z_ENOTTY = 25, Z_ETXTBSY = 26,
     Z_EFBIG = 27, Z_ENOSPC = 28, Z_ESPIPE = 29, Z_EROFS = 30,
     Z_EMLINK = 31, Z_EPIPE = 32, Z_EDOM = 33, Z_ERANGE = 34,
+    Z_ESEGNO = 36,      /* mkseg: no such segment number to give */
 };
 
 /* ZEUS open flags (fcntl.h) */
@@ -70,6 +74,21 @@ static const char * const call_names[] = {
     [57] = "utssys", [58] = "sptrace", [59] = "exece", [60] = "umask",
     [61] = "chroot", [62] = "mdmctl", [63] = "nosys", [64] = "ulimit",
     [65] = "sread", [66] = "swrite", [67] = "getsw",
+};
+
+/*
+ * Arguments of each call: i a word, l a long, p a pointer.  Calls not
+ * listed take none, or are not implemented.
+ */
+static const char * const call_args[68] = {
+    [1] = "i", [3] = "ipi", [4] = "ipi", [5] = "pii", [6] = "i",
+    [8] = "pi", [9] = "pp", [10] = "p", [11] = "pp", [12] = "p",
+    [14] = "pii", [15] = "pi", [16] = "pii", [17] = "p", [18] = "pp",
+    [19] = "ili", [23] = "i", [25] = "l", [27] = "i", [28] = "ip",
+    [30] = "pp", [33] = "pi", [34] = "i", [35] = "p", [37] = "ii",
+    [38] = "iii", [39] = "i", [41] = "ii", [43] = "p", [45] = "ii",
+    [46] = "i", [48] = "ip", [54] = "iip", [55] = "ii", [56] = "p",
+    [57] = "pii", [59] = "ppp", [60] = "i", [61] = "p",
 };
 
 static int host_to_zeus_errno(int e)
@@ -300,6 +319,164 @@ static void do_ioctl(CPUZ8000State *env, int fd, uint32_t req, uint32_t arg)
     }
 }
 
+/* ---- segments of a segmented program ---- */
+
+/* The table entry of a segment that data references can reach. */
+static struct zeus_seg *find_seg(struct image_info *info, uint32_t no)
+{
+    for (int i = 0; i < info->nsegs; i++) {
+        if (info->segs[i].no == no && !info->segs[i].code) {
+            return &info->segs[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * break(address).  With a null address a segmented program gets the end
+ * of its last data segment; otherwise the address names a segment and its
+ * new end.
+ */
+static void do_break(CPUZ8000State *env, TaskState *ts, uint32_t addr)
+{
+    struct image_info *info = ts->info;
+    struct zeus_seg *sg = NULL;
+
+    if (!info->segmented) {
+        /* the stack occupies the top of the space */
+        if (addr >= (env->regs[15] & 0xffff) - 256) {
+            ret_err(env, Z_ENOMEM);
+        } else {
+            ts->brk = addr;
+            ret_ok(env, 0);
+        }
+        return;
+    }
+    if (addr == 0) {
+        for (int i = 0; i < info->nsegs; i++) {
+            if (!info->segs[i].code) {
+                sg = &info->segs[i];
+            }
+        }
+        if (sg) {
+            ret_long(env, (sg->no << 24) | (sg->size & 0xffff));
+            return;
+        }
+    } else {
+        sg = find_seg(info, addr >> 16);
+        if (!sg) {
+            ret_err(env, Z_ENOMEM);
+            return;
+        }
+        sg->size = ROUND_UP(addr & 0xffff, 256);
+    }
+    env->fcw &= ~F_C;
+}
+
+/* ssgbrk(segment, increment): the segment's previous end */
+static void do_ssgbrk(CPUZ8000State *env, struct image_info *info,
+                      uint32_t no, uint32_t incr)
+{
+    struct zeus_seg *sg = find_seg(info, no);
+    uint32_t old;
+
+    if (!info->segmented || !sg) {
+        ret_err(env, Z_ENOMEM);
+        return;
+    }
+    old = sg->size;
+    incr = ROUND_UP(incr, 256);
+    if (old + incr > ZEUS_SPACE_SIZE) {
+        ret_err(env, Z_ENOMEM);
+        return;
+    }
+    sg->size = old + incr;
+    ret_long(env, (no << 24) | (old & 0xffff));
+}
+
+/*
+ * mkseg(segment, size): a new data segment; segment 0 asks for the first
+ * free number from 4 up.  Returns the segment's address.
+ */
+static void do_mkseg(CPUZ8000State *env, struct image_info *info,
+                     uint32_t no, uint32_t size)
+{
+    struct zeus_seg *sg;
+
+    no &= 0x7f;
+    if (!info->segmented) {
+        ret_err(env, Z_EINVAL);
+        return;
+    }
+    if (no == 0) {
+        for (no = 4; no < ZEUS_MAX_SEGS; no++) {
+            bool used = no == info->stack_seg;
+
+            for (int i = 0; i < info->nsegs; i++) {
+                used |= info->segs[i].no == no;
+            }
+            if (!used) {
+                break;
+            }
+        }
+    } else if (find_seg(info, no) || no == info->stack_seg) {
+        no = ZEUS_MAX_SEGS;
+    }
+    if (no == ZEUS_MAX_SEGS) {
+        ret_err(env, Z_ESEGNO);
+        return;
+    }
+    if (info->nsegs == ZEUS_MAX_SEGS) {
+        ret_err(env, Z_ENOMEM);
+        return;
+    }
+    sg = &info->segs[info->nsegs++];
+    sg->no = no;
+    sg->code = false;
+    sg->code_size = 0;
+    sg->size = ROUND_UP(size, 256);
+    zeus_map_space(info->data_offset | (no << 16));
+    ret_long(env, no << 24);
+}
+
+/*
+ * sgstat(buf): ten entries of segment number and size for the segments
+ * holding instructions, the unused ones marked with segment 0xff.
+ */
+static void do_sgstat(CPUZ8000State *env, struct image_info *info,
+                      uint32_t buf)
+{
+    uint8_t *p = zeus_data_ptr(env, buf, 40, true);
+    int n = 0;
+
+    if (!p) {
+        ret_err(env, Z_EFAULT);
+        return;
+    }
+    for (int i = 0; i < info->nsegs && n < 10; i++) {
+        struct zeus_seg *sg = &info->segs[i];
+        uint32_t size = ROUND_UP(sg->code_size, 256);
+
+        if (sg->code_size == 0) {
+            continue;
+        }
+        if (!info->split_id) {
+            /* one entry, for the last such segment */
+            n = 0;
+        }
+        p[4 * n] = sg->no;
+        p[4 * n + 1] = 0;
+        put16(p + 4 * n + 2, size == ZEUS_SPACE_SIZE ? 0xfffe : size);
+        n++;
+    }
+    for (; n < 10; n++) {
+        p[4 * n] = 0xff;
+        p[4 * n + 1] = 0;
+        put16(p + 4 * n + 2, 0);
+    }
+    ret_ok(env, 0);
+}
+
 /*
  * The trace goes to a private copy of standard error, taken before the
  * program can close or redirect descriptor 2.
@@ -321,8 +498,10 @@ void zeus_syscall(CPUZ8000State *env, int num)
 {
     CPUState *cs = env_cpu(env);
     TaskState *ts = get_task_state(cs);
-    uint32_t a0 = env->regs[0], a1 = env->regs[1];
-    uint32_t a2 = env->regs[2], a3 = env->regs[3];
+    bool segmented = ts->info->segmented;
+    uint32_t arg[4] = { env->regs[0], env->regs[1], env->regs[2],
+                        env->regs[3] };
+    uint32_t a0, a1, a2;
     g_autofree char *gpath = NULL;
     g_autofree char *path = NULL;
     void *p;
@@ -331,9 +510,28 @@ void zeus_syscall(CPUZ8000State *env, int num)
     if (num > 67) {
         num = 63;
     }
+    if (call_args[num]) {
+        int w = 0, n = 0;
+
+        memset(arg, 0, sizeof(arg));
+        for (const char *t = call_args[num]; *t; t++, n++) {
+            if (*t == 'i' || (*t == 'p' && !segmented)) {
+                arg[n] = env->regs[w++];
+            } else {
+                arg[n] = ((uint32_t)env->regs[w] << 16) | env->regs[w + 1];
+                if (*t == 'p') {
+                    arg[n] = zeus_long_to_ptr(arg[n]);
+                }
+                w += 2;
+            }
+        }
+    }
+    a0 = arg[0];
+    a1 = arg[1];
+    a2 = arg[2];
     if (do_strace) {
         fprintf(trace_file(), "%d %s(%#x, %#x, %#x, %#x)", getpid(),
-                call_names[num], a0, a1, a2, a3);
+                call_names[num], a0, a1, a2, arg[3]);
     }
 
     switch (num) {
@@ -499,20 +697,27 @@ void zeus_syscall(CPUZ8000State *env, int num)
         ret_long(env, time(NULL));
         break;
 
-    case 17: /* break(addr): the stack occupies the top of the space */
-        if (a0 >= (env->regs[15] & 0xffff) - 256) {
-            ret_err(env, Z_ENOMEM);
-        } else {
-            ts->brk = a0;
-            ret_ok(env, 0);
-        }
+    case 17: /* break(addr) */
+        do_break(env, ts, a0);
+        break;
+
+    case 45: /* ssgbrk(segment, increment) */
+        do_ssgbrk(env, ts->info, a0, a1);
+        break;
+
+    case 55: /* mkseg(segment, size) */
+        do_mkseg(env, ts->info, a0, a1);
+        break;
+
+    case 56: /* sgstat(buf) */
+        do_sgstat(env, ts->info, a0);
         break;
 
     case 19: /* seek(fd, long offset, whence) */
         {
-            off_t off = (int32_t)((a1 << 16) | a2);
-            off_t pos = lseek((int16_t)a0, off, a3 == 0 ? SEEK_SET :
-                              a3 == 1 ? SEEK_CUR : SEEK_END);
+            off_t off = (int32_t)a1;
+            off_t pos = lseek((int16_t)a0, off, a2 == 0 ? SEEK_SET :
+                              a2 == 1 ? SEEK_CUR : SEEK_END);
             if (pos < 0) {
                 ret_err(env, host_to_zeus_errno(errno));
             } else {
@@ -639,10 +844,12 @@ void zeus_syscall(CPUZ8000State *env, int num)
             bool ok;
             uint32_t old = zeus_sig(a0, a1, &ok);
 
-            if (ok) {
-                ret_ok(env, old);
-            } else {
+            if (!ok) {
                 ret_err(env, Z_EINVAL);
+            } else if (segmented) {
+                ret_long(env, zeus_ptr_to_long(old));
+            } else {
+                ret_ok(env, old);
             }
         }
         break;

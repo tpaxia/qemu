@@ -221,15 +221,18 @@ static char **read_vector(CPUZ8000State *env, uint32_t addr, size_t *bytes)
 {
     g_autoptr(GPtrArray) v = g_ptr_array_new_with_free_func(g_free);
 
+    bool segmented = get_task_state(env_cpu(env))->info->segmented;
+    int psize = segmented ? 4 : 2;
+
     for (;;) {
-        uint8_t *p = zeus_data_ptr(env, addr, 2, false);
+        uint8_t *p = zeus_data_ptr(env, addr, psize, false);
         uint32_t s;
         char *str;
 
         if (!p) {
             return NULL;
         }
-        s = lduw_be_p(p);
+        s = segmented ? zeus_long_to_ptr(ldl_be_p(p)) : lduw_be_p(p);
         if (!s) {
             break;
         }
@@ -239,7 +242,7 @@ static char **read_vector(CPUZ8000State *env, uint32_t addr, size_t *bytes)
         }
         *bytes += strlen(str) + 3;
         g_ptr_array_add(v, str);
-        addr += 2;
+        addr += psize;
     }
     g_ptr_array_add(v, NULL);
     return (char **)g_ptr_array_free(g_steal_pointer(&v), FALSE);
@@ -289,12 +292,8 @@ int zeus_exec(CPUZ8000State *env, uint32_t path_addr, uint32_t argv_addr,
     }
     r = read(fd, hdr, 2);
     close(fd);
-    if (r != 2 || hdr[0] != 0xe7 || (hdr[1] != 0x07 && hdr[1] != 0x11)) {
-        if (r == 2 && hdr[0] == 0xe6) {
-            error_report("%s: segmented executables are not supported yet",
-                         gpath);
-            return EACCES;
-        }
+    if (r != 2 || (hdr[0] != 0xe7 && hdr[0] != 0xe6) ||
+        (hdr[1] != 0x07 && hdr[1] != 0x11)) {
         return ENOEXEC;         /* a shell will try it as a script */
     }
 

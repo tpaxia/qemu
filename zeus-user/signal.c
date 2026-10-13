@@ -129,19 +129,27 @@ uint32_t zeus_sig(int zsig, uint32_t handler, bool *ok)
 /* Push the kernel's signal frame and enter the handler. */
 static void deliver(CPUZ8000State *env, int zsig)
 {
+    bool segmented = get_task_state(env_cpu(env))->info->segmented;
     uint32_t handler = handlers[zsig];
     uint32_t sp = (env->regs[15] - 6) & 0xffff;
-    uint8_t *frame = zeus_data_ptr(env, sp, 6, true);
+    uint8_t *frame;
     bool ok;
 
+    frame = zeus_data_ptr(env, (zeus_stack_ptr(env) & 0x7f0000) | sp, 6,
+                          true);
     if (!frame) {
         zeus_die(TARGET_SIGSEGV);
     }
-    stw_be_p(frame, 0x3f00);
+    /* a non-segmented program runs in segment 0x3f as the kernel sees it */
+    stw_be_p(frame, segmented ? (env->pc >> 8) & 0x7f00 : 0x3f00);
     stw_be_p(frame + 2, env->pc & 0xffff);
     stw_be_p(frame + 4, env->fcw);
     env->regs[15] = sp;
-    env->pc = (env->pc & 0xffff0000) | (handler & 0xffff);
+    if (segmented) {
+        env->pc = handler;
+    } else {
+        env->pc = (env->pc & 0xffff0000) | (handler & 0xffff);
+    }
     if (zsig != TARGET_SIGILL && zsig != TARGET_SIGTRAP) {
         zeus_sig(zsig, 0, &ok);
     }
@@ -150,12 +158,17 @@ static void deliver(CPUZ8000State *env, int zsig)
 /* System call 0: return from a signal handler. */
 void zeus_sigreturn(CPUZ8000State *env)
 {
-    uint8_t *frame = zeus_data_ptr(env, env->regs[15], 6, false);
+    bool segmented = get_task_state(env_cpu(env))->info->segmented;
+    uint8_t *frame = zeus_data_ptr(env, zeus_stack_ptr(env), 6, false);
 
     if (!frame) {
         zeus_die(TARGET_SIGSEGV);
     }
-    env->pc = (env->pc & 0xffff0000) | lduw_be_p(frame + 2);
+    if (segmented) {
+        env->pc = zeus_long_to_ptr(ldl_be_p(frame));
+    } else {
+        env->pc = (env->pc & 0xffff0000) | lduw_be_p(frame + 2);
+    }
     env->fcw = (env->fcw & 0xff00) | (lduw_be_p(frame + 4) & 0x00fc);
     env->regs[15] = (env->regs[15] + 6) & 0xffff;
 }
@@ -190,7 +203,7 @@ void zeus_force_signal(CPUZ8000State *env, int zsig, const char *what)
     }
     fflush(stdout);
     fprintf(stderr, "qemu-" TARGET_NAME ": %s, pc %04x\n", what,
-            env->pc & 0xffff);
+            env->pc & 0x7fffff);
     zeus_die(zsig);
 }
 

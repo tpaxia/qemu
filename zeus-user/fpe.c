@@ -167,7 +167,8 @@ bool zeus_fpe_enter(CPUZ8000State *env)
     stw_be_p(frame + FR_INSN, env->op0);
     /* as the kernel's trap handler leaves the saved FCW */
     stw_be_p(frame + FR_FCW, (env->fcw & 0xf8fc) | 0x0100);
-    stw_be_p(frame + FR_PCSEG, 0x3f00);
+    stw_be_p(frame + FR_PCSEG,
+             ts->info->segmented ? (env->pc >> 8) & 0x7f00 : 0x3f00);
     stw_be_p(frame + FR_PCOFF, env->pc & 0xffff);
 
     saved.pc = env->pc;
@@ -202,7 +203,11 @@ static void fpe_done(CPUZ8000State *env)
         env->regs[i] = lduw_be_p(frame + 2 * i);
     }
     env->fcw = (saved.fcw & 0xff00) | (lduw_be_p(frame + FR_FCW) & 0x00fc);
-    env->pc = (saved.pc & 0xffff0000) | lduw_be_p(frame + FR_PCOFF);
+    if (ts->info->segmented) {
+        env->pc = zeus_long_to_ptr(ldl_be_p(frame + FR_PCSEG));
+    } else {
+        env->pc = (saved.pc & 0xffff0000) | lduw_be_p(frame + FR_PCOFF);
+    }
     env->data_tag = saved.data_tag;
     ts->in_fpe = false;
 
@@ -215,17 +220,28 @@ static void fpe_done(CPUZ8000State *env)
     }
 }
 
-/* Program memory, in the space the program was using when it trapped. */
-static void *user_ptr(uint32_t addr, uint32_t len, uint32_t tag, bool write)
+/*
+ * Program memory at the address in a register pair, in the space the
+ * program was using when it trapped.  The segment word only counts for a
+ * segmented program.
+ */
+static void *user_ptr(CPUZ8000State *env, int reg, uint32_t len,
+                      uint32_t tag, bool write)
 {
-    addr &= 0xffff;
-    if (len > ZEUS_SPACE_SIZE - addr) {
+    TaskState *ts = get_task_state(env_cpu(env));
+    uint32_t off = env->regs[reg + 1], addr = tag | off;
+
+    if (ts->info->segmented) {
+        addr |= (env->regs[reg] & 0x7f00) << 8;
+    }
+    if (len > ZEUS_SPACE_SIZE - off) {
         return NULL;
     }
-    if (write && len && !page_check_range(tag | addr, len, PAGE_WRITE)) {
+    if (!page_check_range(addr, len ? len : 1,
+                          write ? PAGE_WRITE : PAGE_READ)) {
         return NULL;
     }
-    return g2h_untagged(tag | addr);
+    return g2h_untagged(addr);
 }
 
 /*
@@ -239,8 +255,8 @@ void zeus_fpe_call(CPUZ8000State *env, int num)
 
     switch (num) {
     case FPE_SC_GETTEXT:
-        /* fetch one instruction word at (R6:)R7 into R3 */
-        u = user_ptr(env->regs[7], 2, 0, false);
+        /* fetch one instruction word at RR6 into R3 */
+        u = user_ptr(env, 6, 2, 0, false);
         if (u) {
             env->regs[3] = lduw_be_p(u);
             env->regs[2] = 0;
@@ -249,8 +265,8 @@ void zeus_fpe_call(CPUZ8000State *env, int num)
         }
         break;
     case FPE_SC_GETMEM:
-        /* copy R3 bytes from the program's data at R7 to RR4 */
-        u = user_ptr(env->regs[7], count, saved.data_tag, false);
+        /* copy R3 bytes from the program's data at RR6 to RR4 */
+        u = user_ptr(env, 6, count, saved.data_tag, false);
         k = sys_ptr_rr(env, 4);
         if (u) {
             memcpy(k, u, count);
@@ -260,8 +276,8 @@ void zeus_fpe_call(CPUZ8000State *env, int num)
         }
         break;
     case FPE_SC_PUTMEM:
-        /* copy R3 bytes from RR6 to the program's data at R5 */
-        u = user_ptr(env->regs[5], count, saved.data_tag, true);
+        /* copy R3 bytes from RR6 to the program's data at RR4 */
+        u = user_ptr(env, 4, count, saved.data_tag, true);
         k = sys_ptr_rr(env, 6);
         if (u) {
             memcpy(u, k, count);

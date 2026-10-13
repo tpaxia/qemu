@@ -97,39 +97,57 @@ void zeus_map_space(uint32_t base)
     mmap_unlock();
 }
 
+/* Guest address of a data pointer of the running program. */
+static uint32_t data_addr(CPUZ8000State *env, uint32_t ptr)
+{
+    struct image_info *info = get_task_state(env_cpu(env))->info;
+
+    return info->data_offset | (info->segmented ? ptr & 0x7f0000 : 0) |
+           (ptr & 0xffff);
+}
+
+/* The program's stack pointer, as a data pointer. */
+uint32_t zeus_stack_ptr(CPUZ8000State *env)
+{
+    return zeus_long_to_ptr(((uint32_t)env->regs[14] << 16) | env->regs[15]);
+}
+
 /*
- * Host pointer for a data-space buffer of a non-segmented program, or
- * NULL if it does not fit in the space.
+ * Host pointer for a buffer in the program's data, or NULL if it does not
+ * lie in one mapped segment (or, for a non-segmented program, in its data
+ * space).
  *
  * Pages holding translated code are write-protected on the host, and in a
  * program with one address space code and data share pages.  Before the
  * emulator itself stores into guest memory the pages are checked for
  * writing, which discards the translations and lifts the protection.
  */
-void *zeus_data_ptr(CPUZ8000State *env, uint32_t addr, uint32_t len,
+void *zeus_data_ptr(CPUZ8000State *env, uint32_t ptr, uint32_t len,
                     bool write)
 {
-    addr &= 0xffff;
-    if (len > ZEUS_SPACE_SIZE - addr) {
+    uint32_t addr = data_addr(env, ptr);
+
+    if (len > ZEUS_SPACE_SIZE - (ptr & 0xffff)) {
         return NULL;
     }
-    if (write && len &&
-        !page_check_range(env->data_tag | addr, len, PAGE_WRITE)) {
+    if (!page_check_range(addr, len ? len : 1,
+                          write ? PAGE_WRITE : PAGE_READ)) {
         return NULL;
     }
-    return g2h_untagged(env->data_tag | addr);
+    return g2h_untagged(addr);
 }
 
-/* Host copy of a NUL-terminated data-space string; NULL if unterminated. */
-char *zeus_data_string(CPUZ8000State *env, uint32_t addr)
+/* Host copy of a NUL-terminated data string; NULL if unterminated. */
+char *zeus_data_string(CPUZ8000State *env, uint32_t ptr)
 {
+    uint32_t addr = data_addr(env, ptr);
     const char *p;
-    size_t max;
 
-    addr &= 0xffff;
-    max = ZEUS_SPACE_SIZE - addr;
-    p = g2h_untagged(env->data_tag | addr);
-    if (!memchr(p, 0, max)) {
+    if (!page_check_range(addr, 1, PAGE_READ)) {
+        return NULL;
+    }
+    p = g2h_untagged(addr);
+    if (!memchr(p, 0, ZEUS_SPACE_SIZE - (ptr & 0xffff))) {
         return NULL;
     }
     return g_strdup(p);

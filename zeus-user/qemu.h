@@ -15,8 +15,35 @@
 #include "user/page-protection.h"
 #include "target_cpu.h"
 
-/* Size of one instruction or data space of a non-segmented program. */
+/* Size of one segment, or of a space of a non-segmented program. */
 #define ZEUS_SPACE_SIZE  0x10000
+
+/* A segmented program can name 128 segments. */
+#define ZEUS_MAX_SEGS    128
+
+/*
+ * A program pointer as the emulator carries it: the segment number in
+ * bits 22-16 and the offset below.  A non-segmented program only has
+ * offsets.  A segmented program keeps a pointer in two words, the first
+ * with the segment number in its high byte.
+ */
+static inline uint32_t zeus_long_to_ptr(uint32_t l)
+{
+    return ((l >> 8) & 0x7f0000) | (l & 0xffff);
+}
+
+static inline uint32_t zeus_ptr_to_long(uint32_t p)
+{
+    return ((p & 0x7f0000) << 8) | (p & 0xffff);
+}
+
+/* One entry of a segmented process's segment table. */
+struct zeus_seg {
+    uint8_t no;
+    bool code;              /* in the instruction space of a split image */
+    uint32_t code_size;     /* instruction bytes at the start */
+    uint32_t size;          /* bytes in use, in units of 256 */
+};
 
 /* What the loader found; the first four fields are read by the gdb stub. */
 struct image_info {
@@ -28,6 +55,10 @@ struct image_info {
     uint32_t entry;
     uint32_t brk;           /* first address after bss, in data space */
     bool split_id;          /* separate instruction and data spaces */
+    bool segmented;
+    uint8_t stack_seg;      /* stack segment of a segmented program */
+    int nsegs;
+    struct zeus_seg segs[ZEUS_MAX_SEGS];
 };
 
 struct zeus_binprm {
@@ -96,6 +127,7 @@ extern const char *zeus_sysroot;
 /* memory.c */
 void zeus_memory_init(void);
 void zeus_map_space(uint32_t base);
+uint32_t zeus_stack_ptr(CPUZ8000State *env);
 void *zeus_data_ptr(CPUZ8000State *env, uint32_t addr, uint32_t len,
                     bool write);
 char *zeus_data_string(CPUZ8000State *env, uint32_t addr);
