@@ -5,7 +5,24 @@
  * executes HALT the machine writes the CPU state, a log of port output
  * and the first "dump-size" bytes of RAM to the file named by the "dump"
  * property, then exits.  It exists to compare the translator against a
- * reference interpreter.
+ * reference interpreter and against captures from real hardware.
+ *
+ * Properties:
+ *   dump=FILE       state dump written at HALT
+ *   dump-size=N     bytes of RAM in the dump (default 64 KiB)
+ *   ram-size=N      RAM size, a power of two; smaller sizes repeat across
+ *                   the 8 MiB address space (default 8 MiB)
+ *   io-model=NAME   "stock": the libz8000 standalone emulator's ports;
+ *                   "z8ktest": the z8000_test harness, twelve word
+ *                   registers at ports 0x0100-0x010B (normal I/O) and the
+ *                   same addresses in special I/O
+ *   init=FILE       start state applied after reset instead of the reset
+ *                   vector, one item per line:
+ *                     pc HEX | fcw HEX | reg N HEX |
+ *                     io INDEX HEX | ioseq INDEX SLOT HEX
+ *
+ * With io-model=z8ktest the dump starts with "Z8KT" and carries the twelve
+ * port registers after the control registers.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -35,6 +52,17 @@ struct Z8000TestState {
     uint32_t dump_size;
     uint8_t *io_log;
     uint16_t latch[3];
+
+    MemoryRegion *aliases;
+    uint32_t ram_size;
+    char *io_model;
+    char *init;
+    bool z8ktest_io;
+    /* z8ktest port registers and optional read sequences */
+    uint16_t kt_reg[12];
+    uint16_t kt_seq[12][4];
+    int kt_seq_count[12];
+    int kt_seq_pos[12];
     uint32_t io_count;
 };
 
@@ -113,6 +141,63 @@ static void test_io_write(void *opaque, uint32_t port, uint32_t val,
     }
 }
 
+/* ---- z8000_test harness port model ---- */
+
+static bool kt_match(uint32_t port)
+{
+    return (port & 0xfff0) == 0x0100 && (port & 0x000e) <= 0x000a;
+}
+
+static int kt_index(uint32_t port, int special)
+{
+    return ((port >> 1) & 7) + (special ? 6 : 0);
+}
+
+static uint32_t kt_io_read(void *opaque, uint32_t port, int size, int special)
+{
+    Z8000TestState *s = opaque;
+    uint32_t val;
+    int idx;
+
+    if (!kt_match(port)) {
+        return size == 2 ? 0xffff : 0xff;
+    }
+    idx = kt_index(port, special);
+    if (s->kt_seq_count[idx] > 0) {
+        int pos = MIN(s->kt_seq_pos[idx], s->kt_seq_count[idx] - 1);
+
+        val = s->kt_seq[idx][pos];
+        if (s->kt_seq_pos[idx] < s->kt_seq_count[idx]) {
+            s->kt_seq_pos[idx]++;
+        }
+    } else {
+        val = s->kt_reg[idx];
+    }
+    if (size == 2) {
+        return val;
+    }
+    return (port & 1) ? (val & 0xff) : (val >> 8);
+}
+
+static void kt_io_write(void *opaque, uint32_t port, uint32_t val, int size,
+                        int special)
+{
+    Z8000TestState *s = opaque;
+    int idx;
+
+    if (!kt_match(port)) {
+        return;
+    }
+    idx = kt_index(port, special);
+    if (size == 2) {
+        s->kt_reg[idx] = val;
+    } else if (port & 1) {
+        s->kt_reg[idx] = (s->kt_reg[idx] & 0xff00) | (val & 0xff);
+    } else {
+        s->kt_reg[idx] = (s->kt_reg[idx] & 0x00ff) | ((val & 0xff) << 8);
+    }
+}
+
 static void put16(FILE *f, uint32_t v)
 {
     fputc((v >> 8) & 0xff, f);
@@ -133,7 +218,7 @@ static void test_halt(void *opaque)
         error_report("cannot write dump file '%s'", s->dump);
         exit(1);
     }
-    fwrite("Z8KD", 1, 4, f);
+    fwrite(s->z8ktest_io ? "Z8KT" : "Z8KD", 1, 4, f);
     for (int i = 0; i < 16; i++) {
         put16(f, env->regs[i]);
     }
@@ -146,6 +231,11 @@ static void test_halt(void *opaque)
     put16(f, env->refresh);
     put16(f, env->nspseg);
     put16(f, env->nspoff);
+    if (s->z8ktest_io) {
+        for (int i = 0; i < 12; i++) {
+            put16(f, s->kt_reg[i]);
+        }
+    }
     put16(f, s->io_count >> 16);
     put16(f, s->io_count);
     fwrite(s->io_log, 6, s->io_count, f);
@@ -160,25 +250,95 @@ static const Z8000IOOps test_io_ops = {
     .halt = test_halt,
 };
 
+static const Z8000IOOps kt_io_ops = {
+    .read = kt_io_read,
+    .write = kt_io_write,
+    .halt = test_halt,
+};
+
+/* Apply the start state from the "init" file, replacing the reset vector. */
+static void test_apply_init(Z8000TestState *s)
+{
+    CPUZ8000State *env = &s->cpu->env;
+    g_autofree gchar *text = NULL;
+    g_auto(GStrv) lines = NULL;
+
+    if (!s->init) {
+        return;
+    }
+    if (!g_file_get_contents(s->init, &text, NULL, NULL)) {
+        error_report("cannot read init file '%s'", s->init);
+        exit(1);
+    }
+    lines = g_strsplit(text, "\n", -1);
+    for (int i = 0; lines[i]; i++) {
+        unsigned a, b, c;
+
+        if (sscanf(lines[i], "pc %x", &a) == 1) {
+            env->pc = a;
+        } else if (sscanf(lines[i], "fcw %x", &a) == 1) {
+            env->fcw = a & 0xffff;
+        } else if (sscanf(lines[i], "reg %u %x", &a, &b) == 2 && a < 16) {
+            env->regs[a] = b & 0xffff;
+        } else if (sscanf(lines[i], "ioseq %u %u %x", &a, &b, &c) == 3 &&
+                   a < 12 && b < 4) {
+            s->kt_seq[a][b] = c;
+            s->kt_seq_count[a] = MAX(s->kt_seq_count[a], (int)b + 1);
+        } else if (sscanf(lines[i], "io %u %x", &a, &b) == 2 && a < 12) {
+            s->kt_reg[a] = b;
+        } else if (lines[i][0] && lines[i][0] != '#') {
+            error_report("%s:%d: unrecognised line", s->init, i + 1);
+            exit(1);
+        }
+    }
+}
+
 static void test_cpu_reset(void *opaque)
 {
-    cpu_reset(CPU(opaque));
+    Z8000TestState *s = opaque;
+
+    cpu_reset(CPU(s->cpu));
+    test_apply_init(s);
 }
 
 static void z8000_test_init(MachineState *machine)
 {
     Z8000TestState *s = Z8000_TEST_MACHINE(machine);
 
-    memory_region_init_ram(&s->ram, NULL, "z8000-test.ram", 8 * MiB,
+    if (!is_power_of_2(s->ram_size) || s->ram_size > 8 * MiB ||
+        s->ram_size < 4 * KiB || s->dump_size > s->ram_size) {
+        error_report("invalid ram-size or dump-size");
+        exit(1);
+    }
+    memory_region_init_ram(&s->ram, NULL, "z8000-test.ram", s->ram_size,
                            &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0, &s->ram);
+    if (s->ram_size < 8 * MiB) {
+        /* repeat the RAM across the whole 23-bit address space */
+        int n = 8 * MiB / s->ram_size - 1;
+
+        s->aliases = g_new(MemoryRegion, n);
+        for (int i = 0; i < n; i++) {
+            memory_region_init_alias(&s->aliases[i], NULL,
+                                     "z8000-test.ram-alias", &s->ram, 0,
+                                     s->ram_size);
+            memory_region_add_subregion(get_system_memory(),
+                                        (hwaddr)(i + 1) * s->ram_size,
+                                        &s->aliases[i]);
+        }
+    }
+    s->z8ktest_io = s->io_model && !strcmp(s->io_model, "z8ktest");
+    if (s->io_model && !s->z8ktest_io && strcmp(s->io_model, "stock")) {
+        error_report("unknown io-model '%s'", s->io_model);
+        exit(1);
+    }
 
     if (machine->firmware) {
         g_autofree gchar *data = NULL;
         gsize len;
 
         if (!g_file_get_contents(machine->firmware, &data, &len, NULL) ||
-            len > 8 * MiB) {
+            len > s->ram_size) {
             error_report("cannot load image '%s'", machine->firmware);
             exit(1);
         }
@@ -190,10 +350,10 @@ static void z8000_test_init(MachineState *machine)
     s->latch[1] = 0x0000;
     s->latch[2] = 0x5678;
     s->cpu = Z8000_CPU(cpu_create(machine->cpu_type));
-    s->cpu->io_ops = &test_io_ops;
+    s->cpu->io_ops = s->z8ktest_io ? &kt_io_ops : &test_io_ops;
     s->cpu->io_opaque = s;
-    qemu_register_reset(test_cpu_reset, s->cpu);
-    cpu_reset(CPU(s->cpu));
+    qemu_register_reset(test_cpu_reset, s);
+    test_cpu_reset(s);
 }
 
 static char *test_get_dump(Object *obj, Error **errp)
@@ -209,12 +369,41 @@ static void test_set_dump(Object *obj, const char *value, Error **errp)
     s->dump = g_strdup(value);
 }
 
+static char *test_get_io_model(Object *obj, Error **errp)
+{
+    return g_strdup(Z8000_TEST_MACHINE(obj)->io_model);
+}
+
+static void test_set_io_model(Object *obj, const char *value, Error **errp)
+{
+    Z8000TestState *s = Z8000_TEST_MACHINE(obj);
+
+    g_free(s->io_model);
+    s->io_model = g_strdup(value);
+}
+
+static char *test_get_init(Object *obj, Error **errp)
+{
+    return g_strdup(Z8000_TEST_MACHINE(obj)->init);
+}
+
+static void test_set_init(Object *obj, const char *value, Error **errp)
+{
+    Z8000TestState *s = Z8000_TEST_MACHINE(obj);
+
+    g_free(s->init);
+    s->init = g_strdup(value);
+}
+
 static void z8000_test_instance_init(Object *obj)
 {
     Z8000TestState *s = Z8000_TEST_MACHINE(obj);
 
     s->dump_size = 64 * KiB;
+    s->ram_size = 8 * MiB;
     object_property_add_uint32_ptr(obj, "dump-size", &s->dump_size,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_add_uint32_ptr(obj, "ram-size", &s->ram_size,
                                    OBJ_PROP_FLAG_READWRITE);
 }
 
@@ -233,6 +422,13 @@ static void z8000_test_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_str(oc, "dump", test_get_dump, test_set_dump);
     object_class_property_set_description(oc, "dump",
                                           "file written when the guest halts");
+    object_class_property_add_str(oc, "io-model", test_get_io_model,
+                                  test_set_io_model);
+    object_class_property_set_description(oc, "io-model",
+                                          "port model: stock or z8ktest");
+    object_class_property_add_str(oc, "init", test_get_init, test_set_init);
+    object_class_property_set_description(oc, "init",
+                                          "start state applied after reset");
 }
 
 static const TypeInfo z8000_test_types[] = {
