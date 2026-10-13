@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/times.h>
-#include <termios.h>
 #include <utime.h>
 
 /* ZEUS error numbers that the calls here can return */
@@ -52,10 +51,6 @@ enum {
 #define Z_S_IFREG 0100000
 #define Z_S_IFIFO 0010000
 
-/* ioctl requests used by the C library's stty and gtty */
-#define Z_TIOCGETP 0x7408
-#define Z_TIOCSETP 0x7409
-
 static const char * const call_names[] = {
     [0] = "sigreturn", [1] = "exit", [2] = "fork", [3] = "read",
     [4] = "write", [5] = "open", [6] = "close", [7] = "wait", [8] = "creat",
@@ -85,7 +80,7 @@ static const char * const call_args[68] = {
     [8] = "pi", [9] = "pp", [10] = "p", [11] = "pp", [12] = "p",
     [14] = "pii", [15] = "pi", [16] = "pii", [17] = "p", [18] = "pp",
     [19] = "ili", [23] = "i", [25] = "l", [27] = "i", [28] = "ip",
-    [30] = "pp", [33] = "pi", [34] = "i", [35] = "p", [37] = "ii",
+    [30] = "pp", [31] = "ip", [32] = "ip", [33] = "pi", [34] = "i", [35] = "p", [37] = "ii",
     [38] = "iii", [39] = "i", [41] = "ii", [43] = "p", [45] = "ii",
     [46] = "i", [48] = "ip", [54] = "iip", [55] = "ii", [56] = "p",
     [57] = "pii", [59] = "ppp", [60] = "i", [61] = "p",
@@ -286,36 +281,6 @@ static void do_fcntl(CPUZ8000State *env, int fd, uint32_t cmd, uint32_t arg)
     default:
         ret_err(env, Z_EINVAL);
         break;
-    }
-}
-
-static void do_ioctl(CPUZ8000State *env, int fd, uint32_t req, uint32_t arg)
-{
-    struct termios tio;
-    uint8_t *p;
-
-    switch (req) {
-    case Z_TIOCGETP:
-        if (tcgetattr(fd, &tio) < 0) {
-            ret_err(env, errno == EBADF ? Z_EBADF : Z_ENOTTY);
-            return;
-        }
-        p = zeus_data_ptr(env, arg, 6, true);
-        if (!p) {
-            ret_err(env, Z_EFAULT);
-            return;
-        }
-        /* struct sgttyb: speeds (B9600 = 13), erase, kill, flags */
-        p[0] = 13;
-        p[1] = 13;
-        p[2] = tio.c_cc[VERASE];
-        p[3] = tio.c_cc[VKILL];
-        put16(p + 4, 0x00d8);   /* ECHO | CRMOD | ANYP */
-        ret_ok(env, 0);
-        return;
-    default:
-        ret_err(env, isatty(fd) ? Z_EINVAL : Z_ENOTTY);
-        return;
     }
 }
 
@@ -859,7 +824,22 @@ void zeus_syscall(CPUZ8000State *env, int num)
         break;
 
     case 54: /* ioctl(fd, request, arg) */
-        do_ioctl(env, (int16_t)a0, a1, a2);
+        r = zeus_ioctl(env, (int16_t)a0, a1, a2);
+        if (r) {
+            ret_err(env, r);
+        } else {
+            ret_ok(env, 0);
+        }
+        break;
+
+    case 31: /* stty(fd, struct sgttyb *) */
+    case 32: /* gtty(fd, struct sgttyb *) */
+        r = zeus_ioctl(env, (int16_t)a0, num == 31 ? 0x7409 : 0x7408, a1);
+        if (r) {
+            ret_err(env, r);
+        } else {
+            ret_ok(env, 0);
+        }
         break;
 
     case 57: /* utssys(buf, arg, function) */

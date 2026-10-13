@@ -26,6 +26,7 @@ zeus_user_ss.add(files(
   'signal.c',
   'sout.c',
   'syscall.c',
+  'tty.c',
 ))
 
 specific_ss.add_all(when: 'CONFIG_ZEUS_USER', if_true: zeus_user_ss)

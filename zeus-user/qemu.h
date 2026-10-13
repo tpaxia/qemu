@@ -164,6 +164,9 @@ int zeus_kill(int zpid, int zsig);
 int zeus_exec(CPUZ8000State *env, uint32_t path_addr, uint32_t argv_addr,
               uint32_t envp_addr);
 
+/* tty.c: returns 0 or a ZEUS error number */
+int zeus_ioctl(CPUZ8000State *env, int fd, uint32_t req, uint32_t arg);
+
 /* syscall.c */
 void zeus_syscall(CPUZ8000State *env, int num);
 
