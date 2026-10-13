@@ -20,3 +20,4 @@ source hexagon/Kconfig
 
 config TARGET_BIG_ENDIAN
     bool
+source z8000/Kconfig

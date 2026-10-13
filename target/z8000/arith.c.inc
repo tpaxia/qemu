@@ -1,0 +1,1193 @@
+/*
+ * Z8000 arithmetic, logic and shift primitives with flag computation.
+ *
+ * Derived from the MAME Z8000 core (z8000ops.hxx),
+ * copyright Juergen Buchmueller and Ernesto Corvi, BSD-3-Clause.
+ * Generated from the libz8000 reference sources; keep semantic changes
+ * in sync with that reference.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/* sign bit masks for byte, word and long */
+#define S08 0x80
+#define S16 0x8000
+#define S32 0x80000000
+
+/* get a single flag bit 0/1 */
+#define GET_C       ((env->fcw >> 7) & 1)
+#define GET_Z       ((env->fcw >> 6) & 1)
+#define GET_S       ((env->fcw >> 5) & 1)
+#define GET_PV      ((env->fcw >> 4) & 1)
+#define GET_DA      ((env->fcw >> 3) & 1)
+#define GET_H       ((env->fcw >> 2) & 1)
+
+/* clear a single flag bit */
+#define CLR_C       env->fcw &= ~F_C
+#define CLR_Z       env->fcw &= ~F_Z
+#define CLR_S       env->fcw &= ~F_S
+#define CLR_P       env->fcw &= ~F_PV
+#define CLR_V       env->fcw &= ~F_PV
+#define CLR_DA      env->fcw &= ~F_DA
+#define CLR_H       env->fcw &= ~F_H
+
+/* clear a flag bit combination */
+#define CLR_CZS     env->fcw &= ~(F_C|F_Z|F_S)
+#define CLR_CZSP    env->fcw &= ~(F_C|F_Z|F_S|F_PV)
+#define CLR_CZSV    env->fcw &= ~(F_C|F_Z|F_S|F_PV)
+#define CLR_CZSVH   env->fcw &= ~(F_C|F_Z|F_S|F_PV|F_H)
+#define CLR_ZS      env->fcw &= ~(F_Z|F_S)
+#define CLR_ZSV     env->fcw &= ~(F_Z|F_S|F_PV)
+#define CLR_ZSP     env->fcw &= ~(F_Z|F_S|F_PV)
+
+/* set a single flag bit */
+#define SET_C       env->fcw |= F_C
+#define SET_Z       env->fcw |= F_Z
+#define SET_S       env->fcw |= F_S
+#define SET_P       env->fcw |= F_PV
+#define SET_V       env->fcw |= F_PV
+#define SET_DA      env->fcw |= F_DA
+#define SET_H       env->fcw |= F_H
+
+/* set a flag bit combination */
+#define SET_SC      env->fcw |= F_C | F_S
+
+
+static uint8_t z8000_zsp[256];
+static void __attribute__((constructor)) z8000_zsp_init(void)
+{
+    for (int i = 0; i < 256; i++) {
+        z8000_zsp[i] = ((i == 0) ? F_Z : 0) | ((i & 128) ? F_S : 0) |
+            ((((i >> 7) ^ (i >> 6) ^ (i >> 5) ^ (i >> 4) ^
+               (i >> 3) ^ (i >> 2) ^ (i >> 1) ^ i) & 1) ? 0 : F_PV);
+    }
+}
+
+#define CHK_XXXB_ZS if (!result) SET_Z; else if ((int8_t) result < 0) SET_S
+#define CHK_XXXW_ZS if (!result) SET_Z; else if ((int16_t)result < 0) SET_S
+#define CHK_XXXL_ZS if (!result) SET_Z; else if ((int32_t)result < 0) SET_S
+#define CHK_XXXQ_ZS if (!result) SET_Z; else if ((int64_t)result < 0) SET_S
+
+#define CHK_XXXB_ZSP env->fcw |= z8000_zsp[result]
+
+/* check carry for addition and subtraction */
+#define CHK_ADDX_C if (result < dest) SET_C
+#define CHK_ADCX_C if (result < dest || (result == dest && value)) SET_C
+
+#define CHK_SUBX_C if (result > dest) SET_C
+#define CHK_SBCX_C if (result > dest || (result == dest && value)) SET_C
+
+/* check half carry for A addition and S subtraction */
+#define CHK_ADDB_H  if ((result & 15) < (dest & 15)) SET_H
+#define CHK_ADCB_H  if ((result & 15) < (dest & 15) || ((result & 15) == (dest & 15) && (value & 15))) SET_H
+
+#define CHK_SUBB_H  if ((result & 15) > (dest & 15)) SET_H
+#define CHK_SBCB_H  if ((result & 15) > (dest & 15) || ((result & 15) == (dest & 15) && (value & 15))) SET_H
+
+/* check overflow for addition for byte, word and long */
+#define CHK_ADDB_V if (((value & dest & ~result) | (~value & ~dest & result)) & S08) SET_V
+#define CHK_ADDW_V if (((value & dest & ~result) | (~value & ~dest & result)) & S16) SET_V
+#define CHK_ADDL_V if (((value & dest & ~result) | (~value & ~dest & result)) & S32) SET_V
+
+/* check overflow for subtraction for byte, word and long */
+#define CHK_SUBB_V if (((~value & dest & ~result) | (value & ~dest & result)) & S08) SET_V
+#define CHK_SUBW_V if (((~value & dest & ~result) | (value & ~dest & result)) & S16) SET_V
+#define CHK_SUBL_V if (((~value & dest & ~result) | (value & ~dest & result)) & S32) SET_V
+
+/* check for privileged instruction and trap if executed */
+
+/******************************************
+ add byte
+ flags:  CZSVDH
+ ******************************************/
+static inline uint8_t ADDB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest + value;
+	CLR_CZSVH;      /* first clear C, Z, S, P/V and H flags    */
+	CLR_DA;         /* clear DA (decimal adjust) flag for addb */
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_ADDX_C;     /* set C if result overflowed              */
+	CHK_ADDB_V;     /* set V if result has incorrect sign      */
+	CHK_ADDB_H;     /* set H if lower nibble overflowed        */
+	return result;
+}
+
+/******************************************
+ add word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t ADDW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest + value;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_ADDX_C;     /* set C if result overflowed              */
+	CHK_ADDW_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ add long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t ADDL(CPUZ8000State *env, uint32_t dest, uint32_t value)
+{
+	uint32_t result = dest + value;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	CHK_ADDX_C;     /* set C if result overflowed              */
+	CHK_ADDL_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ add with carry byte
+ flags:  CZSVDH
+ ******************************************/
+static inline uint8_t ADCB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest + value + GET_C;
+	CLR_CZSVH;      /* first clear C, Z, S, P/V and H flags    */
+	CLR_DA;         /* clear DA (decimal adjust) flag for adcb */
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_ADCX_C;     /* set C if result overflowed              */
+	CHK_ADDB_V;     /* set V if result has incorrect sign      */
+	CHK_ADCB_H;     /* set H if lower nibble overflowed        */
+	return result;
+}
+
+/******************************************
+ add with carry word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t ADCW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest + value + GET_C;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_ADCX_C;     /* set C if result overflowed              */
+	CHK_ADDW_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ subtract byte
+ flags:  CZSVDH
+ ******************************************/
+static inline uint8_t SUBB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest - value;
+	CLR_CZSVH;      /* first clear C, Z, S, P/V and H flags    */
+	SET_DA;         /* set DA (decimal adjust) flag for subb   */
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBB_V;     /* set V if result has incorrect sign      */
+	CHK_SUBB_H;     /* set H if lower nibble underflowed       */
+	return result;
+}
+
+/******************************************
+ subtract word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SUBW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest - value;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBW_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ subtract long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SUBL(CPUZ8000State *env, uint32_t dest, uint32_t value)
+{
+	uint32_t result = dest - value;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBL_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ subtract with carry byte
+ flags:  CZSVDH
+ ******************************************/
+static inline uint8_t SBCB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest - value - GET_C;
+	CLR_CZSVH;      /* first clear C, Z, S, P/V and H flags    */
+	SET_DA;         /* set DA (decimal adjust) flag for sbcb   */
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_SBCX_C;     /* set C if result underflowed             */
+	CHK_SUBB_V;     /* set V if result has incorrect sign      */
+	CHK_SBCB_H;     /* set H if lower nibble underflowed       */
+	return result;
+}
+
+/******************************************
+ subtract with carry word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SBCW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest - value - GET_C;
+	CLR_CZSV;       /* first clear C, Z, S, P/V flags          */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_SBCX_C;     /* set C if result underflowed             */
+	CHK_SUBW_V;     /* set V if result has incorrect sign      */
+	return result;
+}
+
+/******************************************
+ logical or byte
+ flags:  -ZSP--
+ ******************************************/
+static inline uint8_t ORB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest | value;
+	CLR_ZSP;        /* first clear Z, S, P/V flags             */
+	CHK_XXXB_ZSP;   /* set Z, S and P flags for result byte    */
+	return result;
+}
+
+/******************************************
+ logical or word
+ flags:  -ZS---
+ ******************************************/
+static inline uint16_t ORW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest | value;
+	CLR_ZS;         /* first clear Z, and S flags              */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	return result;
+}
+
+/******************************************
+ logical and byte
+ flags:  -ZSP--
+ ******************************************/
+static inline uint8_t ANDB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest & value;
+	CLR_ZSP;        /* first clear Z,S and P/V flags           */
+	CHK_XXXB_ZSP;   /* set Z, S and P flags for result byte    */
+	return result;
+}
+
+/******************************************
+ logical and word
+ flags:  -ZS---
+ ******************************************/
+static inline uint16_t ANDW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest & value;
+	CLR_ZS;         /* first clear Z and S flags               */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	return result;
+}
+
+/******************************************
+ logical exclusive or byte
+ flags:  -ZSP--
+ ******************************************/
+static inline uint8_t XORB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest ^ value;
+	CLR_ZSP;        /* first clear Z, S and P/V flags          */
+	CHK_XXXB_ZSP;   /* set Z, S and P flags for result byte    */
+	return result;
+}
+
+/******************************************
+ logical exclusive or word
+ flags:  -ZS---
+ ******************************************/
+static inline uint16_t XORW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest ^ value;
+	CLR_ZS;         /* first clear Z and S flags               */
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	return result;
+}
+
+
+/******************************************
+ compare byte
+ flags:  CZSV--
+ ******************************************/
+static inline void CPB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest - value;
+	CLR_CZSV;       /* first clear C, Z, S and P/V flags       */
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBB_V;
+}
+
+/******************************************
+ compare word
+ flags:  CZSV--
+ ******************************************/
+static inline void CPW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest - value;
+	CLR_CZSV;
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBW_V;
+}
+
+/******************************************
+ compare long
+ flags:  CZSV--
+ ******************************************/
+static inline void CPL(CPUZ8000State *env, uint32_t dest, uint32_t value)
+{
+	uint32_t result = dest - value;
+	CLR_CZSV;
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	CHK_SUBX_C;     /* set C if result underflowed             */
+	CHK_SUBL_V;
+}
+
+/******************************************
+ complement byte
+ flags: -ZSP--
+ ******************************************/
+static inline uint8_t COMB(CPUZ8000State *env, uint8_t dest)
+{
+	uint8_t result = ~dest;
+	CLR_ZSP;
+	CHK_XXXB_ZSP;   /* set Z, S and P flags for result byte    */
+	return result;
+}
+
+/******************************************
+ complement word
+ flags: -ZS---
+ ******************************************/
+static inline uint16_t COMW(CPUZ8000State *env, uint16_t dest)
+{
+	uint16_t result = ~dest;
+	CLR_ZS;
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	return result;
+}
+
+/******************************************
+ negate byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t NEGB(CPUZ8000State *env, uint8_t dest)
+{
+	uint8_t result = (uint8_t) -dest;
+	CLR_CZSV;
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (result > 0) SET_C;
+	if (result == S08) SET_V;
+	return result;
+}
+
+/******************************************
+ negate word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t NEGW(CPUZ8000State *env, uint16_t dest)
+{
+	uint16_t result = (uint16_t) -dest;
+	CLR_CZSV;
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (result > 0) SET_C;
+	if (result == S16) SET_V;
+	return result;
+}
+
+/******************************************
+ test byte
+ flags:  -ZSP--
+ ******************************************/
+static inline void TESTB(CPUZ8000State *env, uint8_t result)
+{
+	CLR_ZSP;
+	CHK_XXXB_ZSP;   /* set Z and S flags for result byte       */
+}
+
+/******************************************
+ test word
+ flags:  -ZS---
+ ******************************************/
+static inline void TESTW(CPUZ8000State *env, uint16_t dest)
+{
+	CLR_ZS;
+	if (!dest) SET_Z; else if (dest & S16) SET_S;
+}
+
+/******************************************
+ test long
+ flags:  -ZS---
+ ******************************************/
+static inline void TESTL(CPUZ8000State *env, uint32_t dest)
+{
+	CLR_ZS;
+	if (!dest) SET_Z; else if (dest & S32) SET_S;
+}
+
+/******************************************
+ increment byte
+ flags: -ZSV--
+ ******************************************/
+static inline uint8_t INCB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest + value;
+	CLR_ZSV;
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_ADDB_V;     /* set V if result overflowed              */
+	return result;
+}
+
+/******************************************
+ increment word
+ flags: -ZSV--
+ ******************************************/
+static inline uint16_t INCW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest + value;
+	CLR_ZSV;
+	CHK_XXXW_ZS;    /* set Z and S flags for result byte       */
+	CHK_ADDW_V;     /* set V if result overflowed              */
+	return result;
+}
+
+/******************************************
+ decrement byte
+ flags: -ZSV--
+ ******************************************/
+static inline uint8_t DECB(CPUZ8000State *env, uint8_t dest, uint8_t value)
+{
+	uint8_t result = dest - value;
+	CLR_ZSV;
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	CHK_SUBB_V;     /* set V if result overflowed              */
+	return result;
+}
+
+/******************************************
+ decrement word
+ flags: -ZSV--
+ ******************************************/
+static inline uint16_t DECW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint16_t result = dest - value;
+	CLR_ZSV;
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	CHK_SUBW_V;     /* set V if result overflowed              */
+	return result;
+}
+
+/******************************************
+ multiply words
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t MULTW(CPUZ8000State *env, uint16_t dest, uint16_t value)
+{
+	uint32_t result = (int32_t)(int16_t)dest * (int16_t)value;
+	CLR_CZSV;
+	CHK_XXXL_ZS;
+	if((int32_t)result < -0x8000 || (int32_t)result >= 0x8000) SET_C;
+	return result;
+}
+
+/******************************************
+ multiply longs
+ flags:  CZSV--
+ ******************************************/
+static inline uint64_t MULTL(CPUZ8000State *env, uint32_t dest, uint32_t value)
+{
+	uint64_t result = (int64_t)(int32_t)dest * (int32_t)value;
+	CLR_CZSV;
+	CHK_XXXQ_ZS;
+	/* C means "the low half cannot represent the product" - the manual sets it
+	   for a product < -2^31 or >= 2^31.  Confirmed on silicon by
+	   mame_multl_c_bound_pos/neg/over: products of exactly 0x7fffffff and
+	   -0x80000000 DO fit and must leave C clear. */
+	if((int64_t)result < -0x80000000LL || (int64_t)result >= 0x80000000LL) SET_C;
+	return result;
+}
+
+/******************************************
+ divide long by word
+ flags: CZSV--
+ ******************************************/
+static inline uint32_t DIVW(CPUZ8000State *env, uint32_t dest, uint16_t value)
+{
+	uint32_t result = dest;
+	uint16_t remainder = 0;
+	CLR_CZSV;
+	if (value)
+	{
+		uint16_t qsign = ((dest >> 16) ^ value) & S16;
+		uint16_t rsign = (dest >> 16) & S16;
+		if ((int32_t)dest < 0) dest = -dest;
+		if ((int16_t)value < 0) value = -value;
+		result = dest / value;
+		remainder = dest % value;
+		if (qsign) result = -result;
+		if (rsign) remainder = -remainder;
+		if ((int32_t)result < -0x8000 || (int32_t)result > 0x7fff)
+		{
+			int32_t temp = (int32_t)result >> 1;
+			SET_V;
+			if (temp >= -0x8000 && temp <= 0x7fff)
+			{
+				/* CASE 4: quotient is a 17-bit two's complement number; the
+				   register holds only the lower 16 bits.  Z/S are set from the
+				   FULL quotient's sign (manual: "according to the value of the
+				   quotient"), not the truncated 16-bit result. */
+				if (!result) SET_Z; else if ((int32_t)result < 0) SET_S;
+				SET_C;
+			}
+		}
+		else
+		{
+			CHK_XXXW_ZS;
+		}
+		result = ((uint32_t)remainder << 16) | (result & 0xffff);
+	}
+	else
+	{
+		SET_Z;
+		SET_V;
+	}
+	return result;
+}
+
+/******************************************
+ divide quad word by long
+ flags: CZSV--
+ ******************************************/
+static inline uint64_t DIVL(CPUZ8000State *env, uint64_t dest, uint32_t value)
+{
+	uint64_t result = dest;
+	uint32_t remainder = 0;
+	CLR_CZSV;
+	if (value)
+	{
+		uint32_t qsign = ((dest >> 32) ^ value) & S32;
+		uint32_t rsign = (dest >> 32) & S32;
+		if ((int64_t)dest < 0) dest = -dest;
+		if ((int32_t)value < 0) value = -value;
+		result = dest / value;
+		remainder = dest % value;
+		if (qsign) result = -result;
+		if (rsign) remainder = -remainder;
+		if ((int64_t)result < -0x80000000LL || (int64_t)result > 0x7fffffff)
+		{
+			int64_t temp = (int64_t)result >> 1;
+			SET_V;
+			if (temp >= -0x80000000LL && temp <= 0x7fffffff)
+			{
+				/* CASE 4: quotient is a 33-bit two's complement number; the
+				   register holds only the lower 32 bits.  Z/S are set from the
+				   FULL quotient's sign, not the truncated 32-bit result. */
+				if (!result) SET_Z; else if ((int64_t)result < 0) SET_S;
+				SET_C;
+			}
+		}
+		else
+		{
+			CHK_XXXL_ZS;    /* Z/S from full 32-bit quotient */
+		}
+		result = ((uint64_t)remainder << 32) | (result & 0xffffffff);
+	}
+	else
+	{
+		SET_Z;
+		SET_V;
+	}
+	return result;
+}
+
+/******************************************
+ rotate left byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t RLB(CPUZ8000State *env, uint8_t dest, uint8_t twice)
+{
+	uint8_t result = (dest << 1) | (dest >> 7);
+	uint8_t v = (result ^ dest) & S08;
+	CLR_CZSV;
+	if (twice) {
+		uint8_t prev = result;
+		result = (result << 1) | (result >> 7);
+		v |= (result ^ prev) & S08;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (result & 0x01) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate left word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t RLW(CPUZ8000State *env, uint16_t dest, uint8_t twice)
+{
+	uint16_t result = (dest << 1) | (dest >> 15);
+	uint16_t v = (result ^ dest) & S16;
+	CLR_CZSV;
+	if (twice) {
+		uint16_t prev = result;
+		result = (result << 1) | (result >> 15);
+		v |= (result ^ prev) & S16;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (result & 0x0001) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate left through carry byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t RLCB(CPUZ8000State *env, uint8_t dest, uint8_t twice)
+{
+	uint8_t c = dest & S08;
+	uint8_t result = (dest << 1) | GET_C;
+	uint8_t v = (result ^ dest) & S08;
+	CLR_CZSV;
+	if (twice) {
+		uint8_t c1 = c >> 7;
+		uint8_t prev = result;
+		c = result & S08;
+		result = (result << 1) | c1;
+		v |= (result ^ prev) & S08;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate left through carry word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t RLCW(CPUZ8000State *env, uint16_t dest, uint8_t twice)
+{
+	uint16_t c = dest & S16;
+	uint16_t result = (dest << 1) | GET_C;
+	uint16_t v = (result ^ dest) & S16;
+	CLR_CZSV;
+	if (twice) {
+		uint16_t c1 = c >> 15;
+		uint16_t prev = result;
+		c = result & S16;
+		result = (result << 1) | c1;
+		v |= (result ^ prev) & S16;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate right byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t RRB(CPUZ8000State *env, uint8_t dest, uint8_t twice)
+{
+	uint8_t result = (dest >> 1) | (dest << 7);
+	uint8_t v = (result ^ dest) & S08;
+	CLR_CZSV;
+	if (twice) {
+		uint8_t prev = result;
+		result = (result >> 1) | (result << 7);
+		v |= (result ^ prev) & S08;
+	}
+	if (!result) SET_Z; else if (result & S08) SET_SC;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate right word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t RRW(CPUZ8000State *env, uint16_t dest, uint8_t twice)
+{
+	uint16_t result = (dest >> 1) | (dest << 15);
+	uint16_t v = (result ^ dest) & S16;
+	CLR_CZSV;
+	if (twice) {
+		uint16_t prev = result;
+		result = (result >> 1) | (result << 15);
+		v |= (result ^ prev) & S16;
+	}
+	if (!result) SET_Z; else if (result & S16) SET_SC;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate right through carry byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t RRCB(CPUZ8000State *env, uint8_t dest, uint8_t twice)
+{
+	uint8_t c = dest & 1;
+	uint8_t result = (dest >> 1) | (GET_C << 7);
+	uint8_t v = (result ^ dest) & S08;
+	CLR_CZSV;
+	if (twice) {
+		uint8_t c1 = c << 7;
+		uint8_t prev = result;
+		c = result & 1;
+		result = (result >> 1) | c1;
+		v |= (result ^ prev) & S08;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ rotate right through carry word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t RRCW(CPUZ8000State *env, uint16_t dest, uint8_t twice)
+{
+	uint16_t c = dest & 1;
+	uint16_t result = (dest >> 1) | (GET_C << 15);
+	uint16_t v = (result ^ dest) & S16;
+	CLR_CZSV;
+	if (twice) {
+		uint16_t c1 = c << 15;
+		uint16_t prev = result;
+		c = result & 1;
+		result = (result >> 1) | c1;
+		v |= (result ^ prev) & S16;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift dynamic arithmetic byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t SDAB(CPUZ8000State *env, uint8_t dest, int8_t count)
+{
+	int8_t result = (int8_t) dest;
+	uint8_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int8_t prev = result;
+		c = result & S08;
+		result <<= 1;
+		v |= (result ^ prev) & S08;
+		count--;
+	}
+	while (count < 0) {
+		c = result & 0x01;
+		result >>= 1;
+		count++;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint8_t)result;
+}
+
+/******************************************
+ shift dynamic arithmetic word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SDAW(CPUZ8000State *env, uint16_t dest, int8_t count)
+{
+	int16_t result = (int16_t) dest;
+	uint16_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int16_t prev = result;
+		c = result & S16;
+		result <<= 1;
+		v |= (result ^ prev) & S16;
+		count--;
+	}
+	while (count < 0) {
+		c = result & 0x0001;
+		result >>= 1;
+		count++;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint16_t)result;
+}
+
+/******************************************
+ shift dynamic arithmetic long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SDAL(CPUZ8000State *env, uint32_t dest, int8_t count)
+{
+	int32_t result = (int32_t) dest;
+	uint32_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int32_t prev = result;
+		c = result & S32;
+		result <<= 1;
+		v |= (result ^ prev) & S32;
+		count--;
+	}
+	while (count < 0) {
+		c = result & 0x00000001;
+		result >>= 1;
+		count++;
+	}
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint32_t) result;
+}
+
+/******************************************
+ shift dynamic logic byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t SDLB(CPUZ8000State *env, uint8_t dest, int8_t count)
+{
+	uint8_t result = dest;
+	uint8_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint8_t prev = result;
+		c = result & S08;
+		result <<= 1;
+		v |= (result ^ prev) & S08;
+		count--;
+	}
+	while (count < 0) {
+		uint8_t prev = result;
+		c = result & 0x01;
+		result >>= 1;
+		v |= (result ^ prev) & S08;
+		count++;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift dynamic logic word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SDLW(CPUZ8000State *env, uint16_t dest, int8_t count)
+{
+	uint16_t result = dest;
+	uint16_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint16_t prev = result;
+		c = result & S16;
+		result <<= 1;
+		v |= (result ^ prev) & S16;
+		count--;
+	}
+	while (count < 0) {
+		uint16_t prev = result;
+		c = result & 0x0001;
+		result >>= 1;
+		v |= (result ^ prev) & S16;
+		count++;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift dynamic logic long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SDLL(CPUZ8000State *env, uint32_t dest, int8_t count)
+{
+	uint32_t result = dest;
+	uint32_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint32_t prev = result;
+		c = result & S32;
+		result <<= 1;
+		v |= (result ^ prev) & S32;
+		count--;
+	}
+	while (count < 0) {
+		uint32_t prev = result;
+		c = result & 0x00000001;
+		result >>= 1;
+		v |= (result ^ prev) & S32;
+		count++;
+	}
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift left arithmetic byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t SLAB(CPUZ8000State *env, uint8_t dest, uint8_t count)
+{
+	int8_t result = (int8_t) dest;
+	uint8_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int8_t prev = result;
+		c = result & S08;
+		result <<= 1;
+		v |= (result ^ prev) & S08;
+		count--;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint8_t)result;
+}
+
+/******************************************
+ shift left arithmetic word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SLAW(CPUZ8000State *env, uint16_t dest, uint8_t count)
+{
+	int16_t result = (int16_t) dest;
+	uint16_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int16_t prev = result;
+		c = result & S16;
+		result <<= 1;
+		v |= (result ^ prev) & S16;
+		count--;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint16_t)result;
+}
+
+/******************************************
+ shift left arithmetic long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SLAL(CPUZ8000State *env, uint32_t dest, uint8_t count)
+{
+	int32_t result = (int32_t) dest;
+	uint32_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		int32_t prev = result;
+		c = result & S32;
+		result <<= 1;
+		v |= (result ^ prev) & S32;
+		count--;
+	}
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return (uint32_t)result;
+}
+
+/******************************************
+ shift left logic byte
+ flags:  CZS---
+ ******************************************/
+static inline uint8_t SLLB(CPUZ8000State *env, uint8_t dest, uint8_t count)
+{
+	uint8_t result = dest;
+	uint8_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint8_t prev = result;
+		c = result & S08;
+		result <<= 1;
+		v |= (result ^ prev) & S08;
+		count--;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift left logic word
+ flags:  CZS---
+ ******************************************/
+static inline uint16_t SLLW(CPUZ8000State *env, uint16_t dest, uint8_t count)
+{
+	uint16_t result = dest;
+	uint16_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint16_t prev = result;
+		c = result & S16;
+		result <<= 1;
+		v |= (result ^ prev) & S16;
+		count--;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift left logic long
+ flags:  CZS---
+ ******************************************/
+static inline uint32_t SLLL(CPUZ8000State *env, uint32_t dest, uint8_t count)
+{
+	uint32_t result = dest;
+	uint32_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint32_t prev = result;
+		c = result & S32;
+		result <<= 1;
+		v |= (result ^ prev) & S32;
+		count--;
+	}
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift right arithmetic byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t SRAB(CPUZ8000State *env, uint8_t dest, uint8_t count)
+{
+	uint8_t c = (count) ? ((int8_t)dest >> (count - 1)) & 1 : 0;
+	uint8_t result = (uint8_t)((int8_t)dest >> count);
+	CLR_CZSV;
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	return result;
+}
+
+/******************************************
+ shift right arithmetic word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SRAW(CPUZ8000State *env, uint16_t dest, uint8_t count)
+{
+	uint8_t c = (count) ? ((int16_t)dest >> (count - 1)) & 1 : 0;
+	uint16_t result = (uint16_t)((int16_t)dest >> count);
+	CLR_CZSV;
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	return result;
+}
+
+/******************************************
+ shift right arithmetic long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SRAL(CPUZ8000State *env, uint32_t dest, uint8_t count)
+{
+	uint8_t c = (count) ? ((int32_t)dest >> (count - 1)) & 1 : 0;
+	uint32_t result = (uint32_t)((int32_t)dest >> count);
+	CLR_CZSV;
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	return result;
+}
+
+/******************************************
+ shift right logic byte
+ flags:  CZSV--
+ ******************************************/
+static inline uint8_t SRLB(CPUZ8000State *env, uint8_t dest, uint8_t count)
+{
+	uint8_t result = dest;
+	uint8_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint8_t prev = result;
+		c = result & 0x01;
+		result >>= 1;
+		v |= (result ^ prev) & S08;
+		count--;
+	}
+	CHK_XXXB_ZS;    /* set Z and S flags for result byte       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift right logic word
+ flags:  CZSV--
+ ******************************************/
+static inline uint16_t SRLW(CPUZ8000State *env, uint16_t dest, uint8_t count)
+{
+	uint16_t result = dest;
+	uint16_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint16_t prev = result;
+		c = result & 0x0001;
+		result >>= 1;
+		v |= (result ^ prev) & S16;
+		count--;
+	}
+	CHK_XXXW_ZS;    /* set Z and S flags for result word       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+
+/******************************************
+ shift right logic long
+ flags:  CZSV--
+ ******************************************/
+static inline uint32_t SRLL(CPUZ8000State *env, uint32_t dest, uint8_t count)
+{
+	uint32_t result = dest;
+	uint32_t c = 0, v = 0;
+	CLR_CZSV;
+	while (count > 0) {
+		uint32_t prev = result;
+		c = result & 0x00000001;
+		result >>= 1;
+		v |= (result ^ prev) & S32;
+		count--;
+	}
+	CHK_XXXL_ZS;    /* set Z and S flags for result long       */
+	if (c) SET_C;
+	if (v) SET_V;
+	return result;
+}
+

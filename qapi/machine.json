@@ -30,6 +30,8 @@
 #
 # @hexagon: since 11.0
 #
+# @z8000: since 11.1 (ZEUS fork)
+#
 # .. note:: The resulting QMP strings can be appended to the
 #    "qemu-system-" prefix to produce the corresponding QEMU
 #    executable name.  This is true even for "qemu-system-x86_64".
@@ -42,7 +44,7 @@
              'mips64el', 'mipsel', 'or1k', 'ppc',
              'ppc64', 'riscv32', 'riscv64', 'rx', 's390x', 'sh4',
              'sh4eb', 'sparc', 'sparc64', 'tricore',
-             'x86_64', 'xtensa', 'xtensaeb' ] }
+             'x86_64', 'xtensa', 'xtensaeb', 'z8000' ] }
 
 ##
 # @S390CpuState:

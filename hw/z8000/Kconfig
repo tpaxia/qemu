@@ -1,0 +1,4 @@
+config Z8000_TEST
+    bool
+    default y
+    depends on Z8000

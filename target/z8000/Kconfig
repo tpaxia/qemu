@@ -1,0 +1,2 @@
+config Z8000
+    bool
