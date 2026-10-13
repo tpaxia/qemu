@@ -4,6 +4,7 @@
  * Loads non-segmented executables (E707 merged, E711 separate instruction
  * and data spaces) and segmented ones (E607, and E611 with separate
  * spaces), and builds the initial stack the way the ZEUS kernel does.
+ * An overlay (E705) replaces the instructions of a running program.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -13,6 +14,7 @@
 #include "qemu/bswap.h"
 #include "qemu.h"
 
+#define S_MAGIC_OVERLAY      0xe705
 #define S_MAGIC_NONSEG       0xe707
 #define S_MAGIC_NONSEG_SPLIT 0xe711
 #define S_MAGIC_SEG          0xe607
@@ -228,6 +230,7 @@ int zeus_load(const char *filename, char **argv, char **envp,
             memcpy(g2h_untagged(0), image, code);
             memcpy(g2h_untagged(Z8000_DATA_TAG), image + code, dsize);
             info->brk = dsize + bss;
+            info->text_size = code;
         } else {
             if (imsize + bss > ZEUS_SPACE_SIZE) {
                 return -ENOMEM;
@@ -255,6 +258,60 @@ int zeus_load(const char *filename, char **argv, char **envp,
     } else {
         env->fcw = 0;           /* normal mode, non-segmented */
     }
+    env->pc = info->entry;
+    return 0;
+}
+
+/* The kernel compares instruction space sizes in units of 8K. */
+#define OVERLAY_UNIT 0x2000
+
+/*
+ * exec of an overlay: the instructions of the running program are
+ * replaced by those of the file and execution continues at its entry
+ * point.  Data, stack and registers stay as they are.  The caller has
+ * checked that no arguments were passed.  Returns 0 or a negative errno.
+ *
+ * A program with one address space has no instruction space of its own,
+ * so there the kernel only accepts an overlay without instructions.
+ */
+int zeus_overlay(const char *filename, CPUZ8000State *env,
+                 struct image_info *info)
+{
+    g_autofree gchar *data = NULL;
+    gsize len;
+    uint32_t segt, code;
+    const uint8_t *d;
+
+    if (!g_file_get_contents(filename, &data, &len, NULL)) {
+        return -errno;
+    }
+    d = (const uint8_t *)data;
+    if (len < S_HDR_SIZE + S_SEGT_SIZE || lduw_be_p(d) != S_MAGIC_OVERLAY) {
+        return -ENOEXEC;
+    }
+    segt = lduw_be_p(d + 10);
+    code = lduw_be_p(d + S_HDR_SIZE + 4);
+    if (segt < S_SEGT_SIZE || len < S_HDR_SIZE + segt + code) {
+        return -ENOEXEC;
+    }
+    if (info->segmented) {
+        return -ENOEXEC;
+    }
+    if (!info->split_id &&
+        ROUND_UP(code, OVERLAY_UNIT) != ROUND_UP(info->text_size,
+                                                 OVERLAY_UNIT)) {
+        return -ENOMEM;
+    }
+    if (info->split_id) {
+        /* checking for writing discards the old translations */
+        if (!page_check_range(0, ZEUS_SPACE_SIZE, PAGE_WRITE)) {
+            return -ENOMEM;
+        }
+        memset(g2h_untagged(0), 0, ZEUS_SPACE_SIZE);
+        memcpy(g2h_untagged(0), d + S_HDR_SIZE + segt, code);
+        info->text_size = code;
+    }
+    info->entry = ldl_be_p(d + 14) & 0xfffe;
     env->pc = info->entry;
     return 0;
 }

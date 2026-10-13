@@ -249,8 +249,8 @@ static char **read_vector(CPUZ8000State *env, uint32_t addr, size_t *bytes)
 }
 
 /*
- * exece(path, argv, envp).  Returns a host errno; does not return on
- * success.
+ * exece(path, argv, envp).  Returns a host errno.  Does not return on
+ * success, except for an overlay, which continues in this process.
  */
 int zeus_exec(CPUZ8000State *env, uint32_t path_addr, uint32_t argv_addr,
               uint32_t envp_addr)
@@ -292,6 +292,13 @@ int zeus_exec(CPUZ8000State *env, uint32_t path_addr, uint32_t argv_addr,
     }
     r = read(fd, hdr, 2);
     close(fd);
+    if (r == 2 && hdr[0] == 0xe7 && hdr[1] == 0x05) {
+        /* an overlay is not a new program and cannot take arguments */
+        if (gargv[0] || genvp[0]) {
+            return ENOMEM;
+        }
+        return -zeus_overlay(host, env, get_task_state(env_cpu(env))->info);
+    }
     if (r != 2 || (hdr[0] != 0xe7 && hdr[0] != 0xe6) ||
         (hdr[1] != 0x07 && hdr[1] != 0x11)) {
         return ENOEXEC;         /* a shell will try it as a script */

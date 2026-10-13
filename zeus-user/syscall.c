@@ -557,8 +557,12 @@ void zeus_syscall(CPUZ8000State *env, int num)
 
     case 11: /* exec(path, argv) */
     case 59: /* exece(path, argv, envp) */
-        ret_err(env, host_to_zeus_errno(zeus_exec(env, a0, a1,
-                                                  num == 59 ? a2 : 0)));
+        r = zeus_exec(env, a0, a1, num == 59 ? a2 : 0);
+        if (r) {
+            ret_err(env, host_to_zeus_errno(r));
+        } else {
+            env->fcw &= ~F_C;   /* an overlay: the program carries on */
+        }
         break;
 
     case 29: /* pause */

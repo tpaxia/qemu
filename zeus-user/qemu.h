@@ -54,6 +54,7 @@ struct image_info {
 
     uint32_t entry;
     uint32_t brk;           /* first address after bss, in data space */
+    uint32_t text_size;     /* instruction space in use; 0 if not split */
     bool split_id;          /* separate instruction and data spaces */
     bool segmented;
     uint8_t stack_seg;      /* stack segment of a segmented program */
@@ -135,6 +136,8 @@ char *zeus_data_string(CPUZ8000State *env, uint32_t addr);
 /* sout.c */
 int zeus_load(const char *filename, char **argv, char **envp,
               CPUZ8000State *env, struct image_info *info);
+int zeus_overlay(const char *filename, CPUZ8000State *env,
+                 struct image_info *info);
 
 /* fpe.c */
 bool zeus_fpe_enter(CPUZ8000State *env);
