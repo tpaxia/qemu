@@ -107,6 +107,28 @@ void zeus_signal_init(void);
 
 /* syscall.c */
 void zeus_syscall(CPUZ8000State *env, int num);
+
+/*
+ * The identity the program runs under.  Host user and group ids mean
+ * nothing to ZEUS, so the program is the ZEUS super-user.
+ */
+#define ZEUS_UID 0
+#define ZEUS_GID 0
+
+/* fs.c: all return 0 or a descriptor, or a negative host errno */
+void zeus_fs_init(void);
+char *zeus_resolve(const char *gpath, char **canon);
 char *zeus_host_path(const char *guest_path);
+int zeus_fs_open(const char *gpath, int flags, int mode);
+void zeus_fs_close(int fd);
+void zeus_fs_dup(int oldfd, int newfd);
+int zeus_fs_stat(const char *gpath, uint8_t *buf);
+int zeus_fs_fstat(int fd, uint8_t *buf);
+int zeus_fs_chdir(const char *gpath);
+int zeus_fs_unlink(const char *gpath);
+int zeus_fs_link(const char *gold, const char *gnew);
+int zeus_fs_chmod(const char *gpath, int mode);
+int zeus_fs_chown(const char *gpath, int uid, int gid);
+int zeus_fs_access(const char *gpath, int amode);
 
 #endif

@@ -16,7 +16,10 @@
 #include "qemu/bswap.h"
 #include "qemu.h"
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/times.h>
 #include <termios.h>
+#include <utime.h>
 
 /* ZEUS error numbers that the calls here can return */
 enum {
@@ -111,18 +114,6 @@ static int host_to_zeus_errno(int e)
     }
 }
 
-/*
- * Host path for a guest path: absolute paths are looked up under the ZEUS
- * root when one was given with -L; relative paths are left alone.
- */
-char *zeus_host_path(const char *guest_path)
-{
-    if (zeus_sysroot && guest_path[0] == '/') {
-        return g_strconcat(zeus_sysroot, guest_path, NULL);
-    }
-    return g_strdup(guest_path);
-}
-
 /* ---- results ---- */
 
 static void ret_ok(CPUZ8000State *env, uint32_t r4)
@@ -155,6 +146,16 @@ static void ret_host(CPUZ8000State *env, long r)
     }
 }
 
+/* Result of an fs.c call: a value, or a negative host errno. */
+static void ret_fs(CPUZ8000State *env, int r)
+{
+    if (r < 0) {
+        ret_err(env, host_to_zeus_errno(-r));
+    } else {
+        ret_ok(env, r);
+    }
+}
+
 /* ---- individual calls ---- */
 
 static void put16(uint8_t *p, uint32_t v)
@@ -162,50 +163,24 @@ static void put16(uint8_t *p, uint32_t v)
     stw_be_p(p, v);
 }
 
-static void put32(uint8_t *p, uint32_t v)
-{
-    stl_be_p(p, v);
-}
-
-/* struct stat as laid out by ZEUS: 30 bytes */
-static void do_stat(CPUZ8000State *env, int r, const struct stat *st,
+/* stat and fstat: ZEUS struct stat is 30 bytes */
+static void do_stat(CPUZ8000State *env, const char *gpath, int fd,
                     uint32_t buf)
 {
-    uint8_t *p = zeus_data_ptr(env, buf, 30, true);
-    uint32_t mode;
+    uint8_t tmp[30];
+    uint8_t *p;
+    int r = gpath ? zeus_fs_stat(gpath, tmp) : zeus_fs_fstat(fd, tmp);
 
     if (r < 0) {
-        ret_err(env, host_to_zeus_errno(errno));
+        ret_err(env, host_to_zeus_errno(-r));
         return;
     }
+    p = zeus_data_ptr(env, buf, sizeof(tmp), true);
     if (!p) {
         ret_err(env, Z_EFAULT);
         return;
     }
-    mode = st->st_mode & 07777;
-    if (S_ISDIR(st->st_mode)) {
-        mode |= Z_S_IFDIR;
-    } else if (S_ISCHR(st->st_mode)) {
-        mode |= Z_S_IFCHR;
-    } else if (S_ISBLK(st->st_mode)) {
-        mode |= Z_S_IFBLK;
-    } else if (S_ISFIFO(st->st_mode)) {
-        mode |= Z_S_IFIFO;
-    } else {
-        mode |= Z_S_IFREG;
-    }
-    put16(p + 0, st->st_dev);
-    /* inode numbers are 16 bits and zero means "no entry" */
-    put16(p + 2, (st->st_ino & 0xffff) ? st->st_ino : 1);
-    put16(p + 4, mode);
-    put16(p + 6, st->st_nlink);
-    put16(p + 8, st->st_uid);
-    put16(p + 10, st->st_gid);
-    put16(p + 12, st->st_rdev);
-    put32(p + 14, st->st_size);
-    put32(p + 18, st->st_atime);
-    put32(p + 22, st->st_mtime);
-    put32(p + 26, st->st_ctime);
+    memcpy(p, tmp, sizeof(tmp));
     ret_ok(env, 0);
 }
 
@@ -213,14 +188,12 @@ static void do_open(CPUZ8000State *env, uint32_t path_addr, uint32_t zflags,
                     uint32_t mode)
 {
     g_autofree char *gpath = zeus_data_string(env, path_addr);
-    g_autofree char *path = NULL;
     int flags;
 
     if (!gpath) {
         ret_err(env, Z_EFAULT);
         return;
     }
-    path = zeus_host_path(gpath);
     switch (zflags & Z_O_ACCMODE) {
     case 0:
         flags = O_RDONLY;
@@ -247,7 +220,54 @@ static void do_open(CPUZ8000State *env, uint32_t path_addr, uint32_t zflags,
     if (zflags & Z_O_EXCL) {
         flags |= O_EXCL;
     }
-    ret_host(env, open(path, flags, mode & 07777));
+    ret_fs(env, zeus_fs_open(gpath, flags, mode & 07777));
+}
+
+/* fcntl(fd, cmd, arg) */
+static void do_fcntl(CPUZ8000State *env, int fd, uint32_t cmd, uint32_t arg)
+{
+    int r, fl;
+
+    switch (cmd) {
+    case 0: /* F_DUPFD */
+        r = fcntl(fd, F_DUPFD, (int)arg);
+        if (r >= 0) {
+            zeus_fs_dup(fd, r);
+        }
+        ret_host(env, r);
+        break;
+    case 1: /* F_GETFD */
+        ret_host(env, fcntl(fd, F_GETFD));
+        break;
+    case 2: /* F_SETFD */
+        ret_host(env, fcntl(fd, F_SETFD, arg & 1 ? FD_CLOEXEC : 0));
+        break;
+    case 3: /* F_GETFL */
+        fl = fcntl(fd, F_GETFL);
+        if (fl < 0) {
+            ret_host(env, fl);
+            break;
+        }
+        r = (fl & O_ACCMODE) == O_RDONLY ? 0 :
+            (fl & O_ACCMODE) == O_WRONLY ? 1 : 2;
+        r |= (fl & O_NONBLOCK) ? Z_O_NDELAY : 0;
+        r |= (fl & O_APPEND) ? Z_O_APPEND : 0;
+        ret_ok(env, r);
+        break;
+    case 4: /* F_SETFL */
+        fl = fcntl(fd, F_GETFL);
+        if (fl >= 0) {
+            fl &= ~(O_NONBLOCK | O_APPEND);
+            fl |= (arg & Z_O_NDELAY) ? O_NONBLOCK : 0;
+            fl |= (arg & Z_O_APPEND) ? O_APPEND : 0;
+            fl = fcntl(fd, F_SETFL, fl);
+        }
+        ret_host(env, fl < 0 ? -1 : 0);
+        break;
+    default:
+        ret_err(env, Z_EINVAL);
+        break;
+    }
 }
 
 static void do_ioctl(CPUZ8000State *env, int fd, uint32_t req, uint32_t arg)
@@ -288,7 +308,6 @@ void zeus_syscall(CPUZ8000State *env, int num)
     uint32_t a2 = env->regs[2], a3 = env->regs[3];
     g_autofree char *gpath = NULL;
     g_autofree char *path = NULL;
-    struct stat st;
     void *p;
     long r;
 
@@ -330,32 +349,85 @@ void zeus_syscall(CPUZ8000State *env, int num)
         break;
 
     case 6: /* close(fd) */
-        ret_host(env, close((int16_t)a0));
+        r = close((int16_t)a0);
+        if (r == 0) {
+            zeus_fs_close((int16_t)a0);
+        }
+        ret_host(env, r);
         break;
 
     case 8: /* creat(path, mode) */
         do_open(env, a0, 1 | Z_O_CREAT | Z_O_TRUNC, a1);
         break;
 
+    case 9: /* link(old, new) */
+        gpath = zeus_data_string(env, a0);
+        path = zeus_data_string(env, a1);
+        if (!gpath || !path) {
+            ret_err(env, Z_EFAULT);
+            break;
+        }
+        ret_fs(env, zeus_fs_link(gpath, path));
+        break;
+
     case 10: /* unlink(path) */
     case 12: /* chdir(path) */
+    case 14: /* mknod(path, mode, dev) */
+    case 15: /* chmod(path, mode) */
+    case 16: /* chown(path, uid, gid) */
     case 18: /* stat(path, buf) */
+    case 30: /* utime(path, times) */
     case 33: /* access(path, mode) */
+    case 61: /* chroot(path) */
         gpath = zeus_data_string(env, a0);
         if (!gpath) {
             ret_err(env, Z_EFAULT);
             break;
         }
-        path = zeus_host_path(gpath);
-        if (num == 10) {
-            ret_host(env, unlink(path));
-        } else if (num == 12) {
-            ret_host(env, chdir(path));
-        } else if (num == 33) {
-            ret_host(env, access(path, a1 & 7));
-        } else {
-            r = stat(path, &st);
-            do_stat(env, r, &st, a1);
+        switch (num) {
+        case 10:
+            ret_fs(env, zeus_fs_unlink(gpath));
+            break;
+        case 12:
+            ret_fs(env, zeus_fs_chdir(gpath));
+            break;
+        case 14:
+            if ((a1 & 0170000) == Z_S_IFIFO) {
+                path = zeus_host_path(gpath);
+                ret_host(env, mkfifo(path, a1 & 0777));
+            } else {
+                /* device nodes cannot be created in a host directory */
+                ret_err(env, Z_EPERM);
+            }
+            break;
+        case 15:
+            ret_fs(env, zeus_fs_chmod(gpath, a1));
+            break;
+        case 16:
+            ret_fs(env, zeus_fs_chown(gpath, a1, a2));
+            break;
+        case 18:
+            do_stat(env, gpath, -1, a1);
+            break;
+        case 30:
+            {
+                struct utimbuf ut;
+                uint8_t *tp = a1 ? zeus_data_ptr(env, a1, 8, false) : NULL;
+
+                path = zeus_host_path(gpath);
+                if (tp) {
+                    ut.actime = ldl_be_p(tp);
+                    ut.modtime = ldl_be_p(tp + 4);
+                }
+                ret_host(env, utime(path, tp ? &ut : NULL));
+            }
+            break;
+        case 33:
+            ret_fs(env, zeus_fs_access(gpath, a1 & 7));
+            break;
+        default:
+            ret_err(env, Z_EPERM);
+            break;
         }
         break;
 
@@ -390,14 +462,87 @@ void zeus_syscall(CPUZ8000State *env, int num)
         ret_ok(env, getpid() & 0x7fff);
         break;
 
+    case 23: /* setuid(uid) */
+    case 46: /* setgid(gid) */
+        /* one fixed identity; accept and ignore */
+        ret_ok(env, 0);
+        break;
+
     case 24: /* getuid: real and effective */
-        env->regs[5] = geteuid() & 0xffff;
-        ret_ok(env, getuid() & 0xffff);
+        env->regs[5] = ZEUS_UID;
+        ret_ok(env, ZEUS_UID);
         break;
 
     case 47: /* getgid: real and effective */
-        env->regs[5] = getegid() & 0xffff;
-        ret_ok(env, getgid() & 0xffff);
+        env->regs[5] = ZEUS_GID;
+        ret_ok(env, ZEUS_GID);
+        break;
+
+    case 25: /* stime */
+        ret_err(env, Z_EPERM);
+        break;
+
+    case 34: /* nice(incr) */
+        ret_ok(env, 0);
+        break;
+
+    case 35: /* ftime(struct timeb *): time, ms, minutes west, dst flag */
+        {
+            struct timeval tv;
+            struct tm tm;
+            time_t now;
+            uint8_t *tp = zeus_data_ptr(env, a0, 10, true);
+
+            if (!tp) {
+                ret_err(env, Z_EFAULT);
+                break;
+            }
+            gettimeofday(&tv, NULL);
+            now = tv.tv_sec;
+            localtime_r(&now, &tm);
+            stl_be_p(tp, tv.tv_sec);
+            stw_be_p(tp + 4, tv.tv_usec / 1000);
+            stw_be_p(tp + 6, -(tm.tm_gmtoff - (tm.tm_isdst > 0 ? 3600 : 0))
+                             / 60);
+            stw_be_p(tp + 8, tm.tm_isdst > 0);
+            ret_ok(env, 0);
+        }
+        break;
+
+    case 38: /* fcntl(fd, cmd, arg) */
+        do_fcntl(env, (int16_t)a0, a1, a2);
+        break;
+
+    case 42: /* pipe: read end in R4, write end in R5 */
+        {
+            int fds[2];
+
+            if (pipe(fds) < 0) {
+                ret_err(env, host_to_zeus_errno(errno));
+            } else {
+                env->regs[5] = fds[1];
+                ret_ok(env, fds[0]);
+            }
+        }
+        break;
+
+    case 43: /* times(struct tms *): four longs, in 1/60 s */
+        {
+            struct tms t;
+            long hz = sysconf(_SC_CLK_TCK);
+            uint8_t *tp = zeus_data_ptr(env, a0, 16, true);
+
+            if (!tp) {
+                ret_err(env, Z_EFAULT);
+                break;
+            }
+            times(&t);
+            stl_be_p(tp, t.tms_utime * 60 / hz);
+            stl_be_p(tp + 4, t.tms_stime * 60 / hz);
+            stl_be_p(tp + 8, t.tms_cutime * 60 / hz);
+            stl_be_p(tp + 12, t.tms_cstime * 60 / hz);
+            ret_long(env, 0);
+        }
         break;
 
     case 27: /* alarm(seconds) */
@@ -405,8 +550,7 @@ void zeus_syscall(CPUZ8000State *env, int num)
         break;
 
     case 28: /* fstat(fd, buf) */
-        r = fstat((int16_t)a0, &st);
-        do_stat(env, r, &st, a1);
+        do_stat(env, NULL, (int16_t)a0, a1);
         break;
 
     case 36: /* sync */
@@ -416,10 +560,14 @@ void zeus_syscall(CPUZ8000State *env, int num)
 
     case 41: /* dup(fd) and dup2(fd | 0100, newfd) */
         if (a0 & 0100) {
-            ret_host(env, dup2(a0 & 077, (int16_t)a1));
+            r = dup2(a0 & 077, (int16_t)a1);
         } else {
-            ret_host(env, dup((int16_t)a0));
+            r = dup((int16_t)a0);
         }
+        if (r >= 0) {
+            zeus_fs_dup(a0 & 077, r);
+        }
+        ret_host(env, r);
         break;
 
     case 48: /* sig(signo, handler): delivery is not implemented yet */
@@ -428,6 +576,35 @@ void zeus_syscall(CPUZ8000State *env, int num)
 
     case 54: /* ioctl(fd, request, arg) */
         do_ioctl(env, (int16_t)a0, a1, a2);
+        break;
+
+    case 57: /* utssys(buf, arg, function) */
+        if (a2 == 0) {
+            /* uname: four nine-byte strings */
+            static const char uts[4][9] = { "ZEUS", "zeus", "3.21", "3.21" };
+            uint8_t *up = zeus_data_ptr(env, a0, sizeof(uts), true);
+
+            if (!up) {
+                ret_err(env, Z_EFAULT);
+                break;
+            }
+            memcpy(up, uts, sizeof(uts));
+            ret_ok(env, 0);
+        } else if (a2 == 2) {
+            /* ustat: free blocks (long), free inodes, name, pack name */
+            uint8_t *up = zeus_data_ptr(env, a0, 18, true);
+
+            if (!up) {
+                ret_err(env, Z_EFAULT);
+                break;
+            }
+            memset(up, 0, 18);
+            stl_be_p(up, 100000);
+            stw_be_p(up + 4, 10000);
+            ret_ok(env, 0);
+        } else {
+            ret_err(env, Z_EINVAL);
+        }
         break;
 
     case 60: /* umask(mask) */

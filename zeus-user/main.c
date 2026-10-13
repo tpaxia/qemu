@@ -228,6 +228,7 @@ int main(int argc, char **argv)
     thread_cpu = cpu;
 
     zeus_memory_init();
+    zeus_fs_init();
 
     /* The program is named by a guest path when a root is given. */
     host_file = zeus_host_path(argv[optind]);

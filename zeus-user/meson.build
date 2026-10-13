@@ -18,6 +18,7 @@ endif
 common_user_inc += include_directories('include')
 
 zeus_user_ss.add(files(
+  'fs.c',
   'main.c',
   'memory.c',
   'signal.c',
