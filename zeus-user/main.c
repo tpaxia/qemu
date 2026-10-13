@@ -57,15 +57,6 @@ void fork_end(pid_t pid)
     end_exclusive();
 }
 
-static G_NORETURN void fatal_trap(CPUZ8000State *env, const char *what,
-                                  int sig)
-{
-    fflush(stdout);
-    fprintf(stderr, "qemu-" TARGET_NAME ": %s at pc %04x\n", what,
-            env->pc & 0xffff);
-    exit(128 + sig);
-}
-
 void cpu_loop(CPUZ8000State *env)
 {
     CPUState *cs = env_cpu(env);
@@ -94,23 +85,30 @@ void cpu_loop(CPUZ8000State *env)
         case EXCP_Z8000_EPU:
             /* executed by the ZEUS kernel's own software emulator */
             if (!zeus_fpe_enter(env)) {
-                fatal_trap(env, "floating-point instruction", SIGILL);
+                zeus_force_signal(env, TARGET_SIGILL,
+                                  "floating-point instruction");
             }
             break;
         case EXCP_Z8000_PRIV:
-            fatal_trap(env, "privileged instruction", SIGILL);
+            zeus_force_signal(env, TARGET_SIGILL, "illegal instruction");
+            break;
         case EXCP_Z8000_SEGTRAP:
-            fflush(stdout);
-            fprintf(stderr, "qemu-" TARGET_NAME ": memory fault, address "
-                    "%06x, pc %04x\n", ts->fault_addr, env->pc & 0xffff);
-            exit(128 + SIGSEGV);
+            if (ts->in_fpe) {
+                error_report("memory fault inside the floating-point "
+                             "emulator, address %06x", ts->fault_addr);
+                exit(EXIT_FAILURE);
+            }
+            zeus_force_signal(env, TARGET_SIGSEGV, "memory fault");
+            break;
         case EXCP_DEBUG:
-            fatal_trap(env, "breakpoint", SIGTRAP);
+            zeus_force_signal(env, TARGET_SIGTRAP, "breakpoint");
+            break;
         default:
             fprintf(stderr, "qemu-" TARGET_NAME ": unexpected trap %d\n",
                     trapnr);
             exit(EXIT_FAILURE);
         }
+        zeus_process_signals(env);
     }
 }
 
@@ -123,6 +121,7 @@ static void usage(void)
            "-L path           ZEUS root directory; absolute guest paths are\n"
            "                  looked up under it\n"
            "-E var=value      set a variable in the program's environment\n"
+           "-0 name           pass name as the program's argv[0]\n"
            "-cpu model        select CPU (default " TARGET_DEFAULT_CPU_MODEL
            ")\n"
            "-strace           log system calls\n"
@@ -142,6 +141,8 @@ int main(int argc, char **argv)
     struct image_info *info = g_new0(struct image_info, 1);
     struct zeus_binprm *bprm = g_new0(struct zeus_binprm, 1);
     g_autofree char *host_file = NULL;
+    g_autoptr(GPtrArray) opts = g_ptr_array_new();
+    const char *argv0 = NULL;
     const char *term;
     CPUZ8000State *env;
     TaskState *ts;
@@ -154,11 +155,21 @@ int main(int argc, char **argv)
     module_call_init(MODULE_INIT_QOM);
     qemu_add_opts(&qemu_trace_opts);
 
-    /* A small default environment; the host's would not fit in 64K. */
-    g_ptr_array_add(genv, g_strdup("PATH=:/bin:/usr/bin"));
-    g_ptr_array_add(genv, g_strdup("HOME=/"));
-    term = getenv("ZEUS_TERM");
-    g_ptr_array_add(genv, g_strdup_printf("TERM=%s", term ? term : "vt100"));
+    if (zeus_env_is_exact()) {
+        /* started by a ZEUS exec: the environment is the program's own */
+        for (char **e = environ; *e; e++) {
+            if (!zeus_env_is_internal(*e)) {
+                g_ptr_array_add(genv, g_strdup(*e));
+            }
+        }
+    } else {
+        /* a small default environment; the host's would not fit in 64K */
+        g_ptr_array_add(genv, g_strdup("PATH=:/bin:/usr/bin"));
+        g_ptr_array_add(genv, g_strdup("HOME=/"));
+        term = getenv("ZEUS_TERM");
+        g_ptr_array_add(genv,
+                        g_strdup_printf("TERM=%s", term ? term : "vt100"));
+    }
 
     for (;;) {
         const char *r;
@@ -175,21 +186,33 @@ int main(int argc, char **argv)
         if (!strcmp(r, "-")) {
             break;
         } else if (!strcmp(r, "L") && optind < argc) {
-            zeus_sysroot = argv[optind++];
+            /* options kept in opts are passed on when the program execs */
+            zeus_sysroot = realpath(argv[optind++], NULL);
+            if (!zeus_sysroot) {
+                error_report("%s: %s", argv[optind - 1], strerror(errno));
+                exit(1);
+            }
+            g_ptr_array_add(opts, (char *)"-L");
+            g_ptr_array_add(opts, (char *)zeus_sysroot);
         } else if (!strcmp(r, "E") && optind < argc) {
             g_ptr_array_add(genv, g_strdup(argv[optind++]));
+        } else if (!strcmp(r, "0") && optind < argc) {
+            argv0 = argv[optind++];
         } else if (!strcmp(r, "cpu") && optind < argc) {
             cpu_model = argv[optind++];
             if (is_help_option(cpu_model)) {
                 list_cpus();
                 exit(0);
             }
+            g_ptr_array_add(opts, (char *)"-cpu");
+            g_ptr_array_add(opts, (char *)cpu_model);
         } else if (!strcmp(r, "d") && optind < argc) {
             log_mask = argv[optind++];
         } else if (!strcmp(r, "D") && optind < argc) {
             log_file = argv[optind++];
         } else if (!strcmp(r, "strace")) {
             do_strace = 1;
+            g_ptr_array_add(opts, (char *)"-strace");
         } else if (!strcmp(r, "one-insn-per-tb")) {
             one_insn = true;
         } else {
@@ -200,6 +223,8 @@ int main(int argc, char **argv)
         usage();
     }
     g_ptr_array_add(genv, NULL);
+    g_ptr_array_add(opts, NULL);
+    zeus_proc_init(argv[0], (char **)opts->pdata);
 
     {
         int mask = 0;
@@ -240,10 +265,18 @@ int main(int argc, char **argv)
     /* The program is named by a guest path when a root is given. */
     host_file = zeus_host_path(argv[optind]);
     bprm->filename = host_file;
-    rv = zeus_load(host_file, argv + optind, (char **)genv->pdata, env, info);
-    if (rv != 0) {
-        error_report("%s: %s", argv[optind], strerror(-rv));
-        exit(126);
+    {
+        const char *program = argv[optind];
+
+        if (argv0) {
+            argv[optind] = (char *)argv0;
+        }
+        rv = zeus_load(host_file, argv + optind, (char **)genv->pdata, env,
+                       info);
+        if (rv != 0) {
+            error_report("%s: %s", program, strerror(-rv));
+            exit(126);
+        }
     }
 
     ts = g_new0(TaskState, 1);

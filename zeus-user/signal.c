@@ -1,14 +1,22 @@
 /*
  * ZEUS user-mode emulation: host signals
  *
- * Only memory faults are handled so far.  A write to a page holding
- * translated code is resolved by the translator; any other fault taken on
- * behalf of the guest ends the CPU loop iteration with a segment trap.
+ * Memory faults: a write to a page holding translated code is resolved by
+ * the translator; any other fault taken on behalf of the guest ends the CPU
+ * loop iteration with a segment trap.
+ *
+ * ZEUS signals: a signal the program catches is noted by a host handler and
+ * delivered from the CPU loop, the way the ZEUS kernel delivers it: a
+ * six-byte frame (PC segment word, PC offset, FCW) is pushed on the
+ * program's stack and the PC is set to the handler.  System call 0 pops the
+ * frame.  As in ZEUS, a caught signal reverts to its default action when it
+ * is delivered, except SIGILL and SIGTRAP.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu.h"
 #include "accel/tcg/cpu-ops.h"
 #include "user/cpu_loop.h"
@@ -48,6 +56,142 @@ int host_to_target_signal(int sig)
         }
     }
     return 0;
+}
+
+/* What the program asked for each signal: 0 default, 1 ignore, or handler */
+static uint32_t handlers[TARGET_NSIG];
+static volatile sig_atomic_t pending[TARGET_NSIG];
+
+static void guest_signal_handler(int host_sig)
+{
+    int zsig = host_to_target_signal(host_sig);
+
+    if (zsig > 0 && zsig < TARGET_NSIG) {
+        pending[zsig] = 1;
+        if (thread_cpu) {
+            get_task_state(thread_cpu)->signal_pending = 1;
+            cpu_exit(thread_cpu);
+        }
+    }
+}
+
+/* Die the way a ZEUS process dies of a signal, so that a parent sees it. */
+void zeus_die(int zsig)
+{
+    int host = target_to_host_signal(zsig);
+    struct sigaction act = { .sa_handler = SIG_DFL };
+    sigset_t set;
+
+    fflush(NULL);
+    if (host > 0) {
+        sigaction(host, &act, NULL);
+        sigemptyset(&set);
+        sigaddset(&set, host);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        raise(host);
+    }
+    _exit(128 + zsig);
+}
+
+/*
+ * sig(signo, handler): returns the previous value.  *ok is false for a
+ * signal that cannot be set.
+ */
+uint32_t zeus_sig(int zsig, uint32_t handler, bool *ok)
+{
+    int host = target_to_host_signal(zsig);
+    struct sigaction act = { 0 };
+    uint32_t old;
+
+    *ok = zsig > 0 && zsig < TARGET_NSIG && zsig != TARGET_SIGKILL &&
+          host > 0;
+    if (!*ok) {
+        return 0;
+    }
+    old = handlers[zsig];
+    handlers[zsig] = handler;
+    sigemptyset(&act.sa_mask);
+    if (handler == 0) {
+        act.sa_handler = SIG_DFL;
+    } else if (handler == 1) {
+        act.sa_handler = SIG_IGN;
+    } else {
+        /* no SA_RESTART: an interrupted call returns EINTR, as in ZEUS */
+        act.sa_handler = guest_signal_handler;
+    }
+    /* memory faults stay with the emulator's own handler */
+    if (host != SIGSEGV && host != SIGBUS) {
+        sigaction(host, &act, NULL);
+    }
+    return old;
+}
+
+/* Push the kernel's signal frame and enter the handler. */
+static void deliver(CPUZ8000State *env, int zsig)
+{
+    uint32_t handler = handlers[zsig];
+    uint32_t sp = (env->regs[15] - 6) & 0xffff;
+    uint8_t *frame = zeus_data_ptr(env, sp, 6, true);
+    bool ok;
+
+    if (!frame) {
+        zeus_die(TARGET_SIGSEGV);
+    }
+    stw_be_p(frame, 0x3f00);
+    stw_be_p(frame + 2, env->pc & 0xffff);
+    stw_be_p(frame + 4, env->fcw);
+    env->regs[15] = sp;
+    env->pc = (env->pc & 0xffff0000) | (handler & 0xffff);
+    if (zsig != TARGET_SIGILL && zsig != TARGET_SIGTRAP) {
+        zeus_sig(zsig, 0, &ok);
+    }
+}
+
+/* System call 0: return from a signal handler. */
+void zeus_sigreturn(CPUZ8000State *env)
+{
+    uint8_t *frame = zeus_data_ptr(env, env->regs[15], 6, false);
+
+    if (!frame) {
+        zeus_die(TARGET_SIGSEGV);
+    }
+    env->pc = (env->pc & 0xffff0000) | lduw_be_p(frame + 2);
+    env->fcw = (env->fcw & 0xff00) | (lduw_be_p(frame + 4) & 0x00fc);
+    env->regs[15] = (env->regs[15] + 6) & 0xffff;
+}
+
+/* Deliver what arrived; called from the CPU loop between instructions. */
+void zeus_process_signals(CPUZ8000State *env)
+{
+    TaskState *ts = get_task_state(env_cpu(env));
+
+    if (ts->in_fpe) {
+        return;         /* wait for the floating-point instruction to end */
+    }
+    ts->signal_pending = 0;
+    for (int zsig = 1; zsig < TARGET_NSIG; zsig++) {
+        if (pending[zsig]) {
+            pending[zsig] = 0;
+            if (handlers[zsig] > 1) {
+                deliver(env, zsig);
+            } else if (handlers[zsig] == 0) {
+                zeus_die(zsig);
+            }
+        }
+    }
+}
+
+/* A signal raised by the program's own action (a trap). */
+void zeus_force_signal(CPUZ8000State *env, int zsig, const char *what)
+{
+    if (handlers[zsig] > 1) {
+        deliver(env, zsig);
+        return;
+    }
+    fflush(stdout);
+    fprintf(stderr, "qemu-" TARGET_NAME ": %s, pc %04x\n", what,
+            env->pc & 0xffff);
+    zeus_die(zsig);
 }
 
 static void die_from_signal(int sig)
@@ -112,6 +256,17 @@ void zeus_signal_init(void)
 #else
     host_interrupt_signal = SIGUSR2;
 #endif
+    /* signals ignored when we were started stay ignored, and say so */
+    for (int zsig = 1; zsig < TARGET_NSIG; zsig++) {
+        int host = target_to_host_signal(zsig);
+        struct sigaction old;
+
+        if (host > 0 && sigaction(host, NULL, &old) == 0 &&
+            old.sa_handler == SIG_IGN) {
+            handlers[zsig] = 1;
+        }
+    }
+
     sigfillset(&act.sa_mask);
     act.sa_flags = SA_SIGINFO;
     act.sa_sigaction = host_fault_handler;

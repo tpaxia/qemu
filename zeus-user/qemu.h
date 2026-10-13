@@ -110,6 +110,24 @@ void zeus_fpe_call(CPUZ8000State *env, int num);
 
 /* signal.c */
 void zeus_signal_init(void);
+int host_to_target_signal(int sig);
+int target_to_host_signal(int sig);
+uint32_t zeus_sig(int zsig, uint32_t handler, bool *ok);
+void zeus_process_signals(CPUZ8000State *env);
+void zeus_sigreturn(CPUZ8000State *env);
+void zeus_force_signal(CPUZ8000State *env, int zsig, const char *what);
+G_NORETURN void zeus_die(int zsig);
+
+/* proc.c: calls return 0 or a host errno */
+void zeus_proc_init(const char *argv0, char **opts);
+bool zeus_env_is_exact(void);
+bool zeus_env_is_internal(const char *entry);
+int zeus_pid(pid_t host);
+void zeus_fork(CPUZ8000State *env);
+int zeus_wait(CPUZ8000State *env);
+int zeus_kill(int zpid, int zsig);
+int zeus_exec(CPUZ8000State *env, uint32_t path_addr, uint32_t argv_addr,
+              uint32_t envp_addr);
 
 /* syscall.c */
 void zeus_syscall(CPUZ8000State *env, int num);

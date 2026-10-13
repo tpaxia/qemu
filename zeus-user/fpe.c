@@ -208,16 +208,10 @@ static void fpe_done(CPUZ8000State *env)
 
     /* the kernel sends SIGSEGV for the low byte, SIGFPE for the high one */
     if (verdict & 0x00ff) {
-        fflush(stdout);
-        fprintf(stderr, "qemu-" TARGET_NAME ": memory fault in a "
-                "floating-point instruction, pc %04x\n", env->pc & 0xffff);
-        exit(128 + SIGSEGV);
-    }
-    if (verdict & 0xff00) {
-        fflush(stdout);
-        fprintf(stderr, "qemu-" TARGET_NAME ": floating-point exception, "
-                "pc %04x\n", env->pc & 0xffff);
-        exit(128 + SIGFPE);
+        zeus_force_signal(env, TARGET_SIGSEGV,
+                          "memory fault in a floating-point instruction");
+    } else if (verdict & 0xff00) {
+        zeus_force_signal(env, TARGET_SIGFPE, "floating-point exception");
     }
 }
 

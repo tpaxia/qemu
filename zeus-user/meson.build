@@ -22,6 +22,7 @@ zeus_user_ss.add(files(
   'fs.c',
   'main.c',
   'memory.c',
+  'proc.c',
   'signal.c',
   'sout.c',
   'syscall.c',

@@ -337,6 +337,53 @@ void zeus_syscall(CPUZ8000State *env, int num)
     }
 
     switch (num) {
+    case 0: /* return from a signal handler */
+        zeus_sigreturn(env);
+        if (do_strace) {
+            fprintf(trace_file(), "\n");
+        }
+        return;
+
+    case 2: /* fork */
+        zeus_fork(env);
+        break;
+
+    case 7: /* wait: pid in R4, status in R5 */
+        r = zeus_wait(env);
+        if (r) {
+            ret_err(env, host_to_zeus_errno(r));
+        } else {
+            env->fcw &= ~F_C;
+        }
+        break;
+
+    case 11: /* exec(path, argv) */
+    case 59: /* exece(path, argv, envp) */
+        ret_err(env, host_to_zeus_errno(zeus_exec(env, a0, a1,
+                                                  num == 59 ? a2 : 0)));
+        break;
+
+    case 29: /* pause */
+        pause();
+        ret_err(env, Z_EINTR);
+        break;
+
+    case 37: /* kill(pid, sig) */
+        r = zeus_kill((int16_t)a0, a1);
+        if (r) {
+            ret_err(env, host_to_zeus_errno(r));
+        } else {
+            ret_ok(env, 0);
+        }
+        break;
+
+    case 39: /* setpgrp: R0 = 1 sets, 0 reads */
+        if (a0) {
+            setpgid(0, 0);
+        }
+        ret_ok(env, zeus_pid(getpgrp()));
+        break;
+
     case 1: /* exit */
         if (do_strace) {
             fprintf(trace_file(), "\n");
@@ -475,8 +522,8 @@ void zeus_syscall(CPUZ8000State *env, int num)
         break;
 
     case 20: /* getpid: pid and parent pid */
-        env->regs[5] = getppid() & 0x7fff;
-        ret_ok(env, getpid() & 0x7fff);
+        env->regs[5] = zeus_pid(getppid());
+        ret_ok(env, zeus_pid(getpid()));
         break;
 
     case 23: /* setuid(uid) */
@@ -587,8 +634,17 @@ void zeus_syscall(CPUZ8000State *env, int num)
         ret_host(env, r);
         break;
 
-    case 48: /* sig(signo, handler): delivery is not implemented yet */
-        ret_ok(env, 0);
+    case 48: /* sig(signo, handler): the previous value in R4 */
+        {
+            bool ok;
+            uint32_t old = zeus_sig(a0, a1, &ok);
+
+            if (ok) {
+                ret_ok(env, old);
+            } else {
+                ret_err(env, Z_EINVAL);
+            }
+        }
         break;
 
     case 54: /* ioctl(fd, request, arg) */
