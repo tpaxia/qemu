@@ -19,6 +19,9 @@
 #include "qemu/bswap.h"
 #include "qemu.h"
 #include <sys/wait.h>
+#ifdef CONFIG_DARWIN
+#include <libproc.h>
+#endif
 
 #define ENV_PREFIX   "QEMU_ZEUS_"
 #define ENV_EXACT    ENV_PREFIX "ENV=1"
@@ -43,6 +46,23 @@ static void child_add(pid_t host)
 }
 
 /* Host pid for a ZEUS pid the process may signal, or -1. */
+/* The executable a host process runs, if the host can tell us. */
+static bool host_exe(pid_t pid, char *buf, size_t size)
+{
+#ifdef CONFIG_DARWIN
+    return proc_pidpath(pid, buf, size) > 0;
+#else
+    g_autofree char *link = g_strdup_printf("/proc/%ld/exe", (long)pid);
+    ssize_t n = readlink(link, buf, size - 1);
+
+    if (n <= 0) {
+        return false;
+    }
+    buf[n] = '\0';
+    return true;
+#endif
+}
+
 static pid_t host_pid(int zpid)
 {
     gpointer h;
@@ -69,20 +89,13 @@ static pid_t host_pid(int zpid)
         pid_t sid = getsid(0);
 
         for (long host = zpid - 2; host < (1L << 22) + 30000; host += 30000) {
-            g_autofree char *link = NULL;
             char exe[PATH_MAX];
-            ssize_t n;
 
             if (host <= 1 || getsid(host) != sid) {
                 continue;
             }
-            link = g_strdup_printf("/proc/%ld/exe", host);
-            n = readlink(link, exe, sizeof(exe) - 1);
-            if (n > 0) {
-                exe[n] = '\0';
-                if (strcmp(exe, self_exe)) {
-                    continue;
-                }
+            if (host_exe(host, exe, sizeof(exe)) && strcmp(exe, self_exe)) {
+                continue;
             }
             return host;
         }
@@ -98,7 +111,7 @@ void zeus_proc_init(const char *argv0, char **opts)
 {
     const char *kids = getenv(ENV_PREFIX "CHILDREN");
     char buf[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    ssize_t n = host_exe(getpid(), buf, sizeof(buf)) ? strlen(buf) : 0;
 
     if (n > 0) {
         buf[n] = '\0';
@@ -182,11 +195,23 @@ int zeus_wait(CPUZ8000State *env)
         int zsig = host_to_target_signal(WTERMSIG(status));
 
         zstatus = zsig ? zsig : TARGET_SIGKILL;
-#ifdef WCOREDUMP
-        if (WCOREDUMP(status)) {
+        /*
+         * ZEUS writes a core image for these signals; whether the host
+         * did says nothing about what ZEUS would have done.
+         */
+        switch (zstatus) {
+        case TARGET_SIGQUIT:
+        case TARGET_SIGILL:
+        case TARGET_SIGTRAP:
+        case TARGET_SIGABRT:
+        case TARGET_SIGEMT:
+        case TARGET_SIGFPE:
+        case TARGET_SIGBUS:
+        case TARGET_SIGSEGV:
+        case TARGET_SIGSYS:
             zstatus |= 0x80;
+            break;
         }
-#endif
     } else {
         zstatus = 0;
     }

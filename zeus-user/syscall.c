@@ -495,8 +495,24 @@ void zeus_syscall(CPUZ8000State *env, int num)
     a1 = arg[1];
     a2 = arg[2];
     if (do_strace) {
-        fprintf(trace_file(), "%d %s(%#x, %#x, %#x, %#x)", getpid(),
-                call_names[num], a0, a1, a2, arg[3]);
+        /* calls whose first argument is a path show it as a string */
+        static const uint8_t path_calls[] = {
+            5, 8, 9, 10, 11, 12, 14, 15, 16, 18, 30, 33, 59, 61,
+        };
+        g_autofree char *name = NULL;
+
+        for (int i = 0; i < ARRAY_SIZE(path_calls); i++) {
+            if (path_calls[i] == num) {
+                name = zeus_data_string(env, a0);
+            }
+        }
+        if (name) {
+            fprintf(trace_file(), "%d %s(\"%s\", %#x, %#x, %#x)", getpid(),
+                    call_names[num], name, a1, a2, arg[3]);
+        } else {
+            fprintf(trace_file(), "%d %s(%#x, %#x, %#x, %#x)", getpid(),
+                    call_names[num], a0, a1, a2, arg[3]);
+        }
     }
 
     switch (num) {

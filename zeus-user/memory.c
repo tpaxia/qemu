@@ -17,6 +17,12 @@
 #include "user/mmap.h"
 #include <sys/mman.h>
 
+#ifdef CONFIG_DARWIN
+/* defined with the guest-base probing code on other hosts */
+uintptr_t guest_base;
+bool have_guest_base;
+#endif
+
 unsigned long reserved_va;
 unsigned long guest_addr_max;
 abi_ulong mmap_next_start;

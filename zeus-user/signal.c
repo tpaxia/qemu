@@ -247,9 +247,18 @@ static void host_fault_handler(int sig, siginfo_t *info, void *puc)
     bool is_write = host_signal_write(info, uc);
     MMUAccessType access_type = adjust_signal_pc(&pc, is_write);
 
-    /* A write to a page protected because it holds translated code. */
-    if (sig == SIGSEGV && is_write && is_valid &&
-        info->si_code == SEGV_ACCERR &&
+    /*
+     * A write to a page protected because it holds translated code.
+     * macOS reports a protection fault as SIGBUS, not as SIGSEGV with
+     * SEGV_ACCERR.
+     */
+#ifdef CONFIG_DARWIN
+    bool protection = sig == SIGBUS;
+#else
+    bool protection = sig == SIGSEGV && info->si_code == SEGV_ACCERR;
+#endif
+
+    if (protection && is_write && is_valid &&
         handle_sigsegv_accerr_write(cpu, host_signal_mask(uc), pc,
                                     guest_addr)) {
         return;

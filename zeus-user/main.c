@@ -29,6 +29,8 @@
 
 __thread CPUState *thread_cpu;
 int do_strace;
+extern char **environ;
+
 const char *zeus_sysroot;
 
 bool qemu_cpu_is_self(CPUState *cpu)

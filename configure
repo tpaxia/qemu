@@ -822,7 +822,7 @@ if [ -n "$host_arch" ] && [ -d "$source_path/common-user/host/$host_arch" ]; the
     # host support is present.
     if [ "$zeus_user" != no ]; then
         if [ "$zeus_user" = "" ]; then
-            test $host_os = linux && zeus_user=yes
+            { test $host_os = linux || test $host_os = darwin; } && zeus_user=yes
         fi
         if [ "$zeus_user" = "yes" ]; then
             mak_wilds="${mak_wilds} $source_path/configs/targets/*-zeus-user.mak"

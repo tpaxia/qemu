@@ -15,6 +15,11 @@ if host_os == 'linux' and not have_linux_user
   common_user_inc += include_directories('../linux-user/include/host/' / host_arch)
 endif
 
+if host_os == 'darwin'
+  # macOS is not a host of linux-user or bsd-user; its files are here
+  common_user_inc += include_directories('include/host/darwin' / host_arch)
+endif
+
 common_user_inc += include_directories('include')
 
 zeus_user_ss.add(files(
